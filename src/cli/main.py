@@ -403,6 +403,181 @@ def interactive():
 
 
 @app.command()
+def rebuild(
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Custom config file"),
+    profile: Optional[str] = typer.Option(None, "--profile", "-p", help="Config profile"),
+    confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """
+    Rebuild all vectors and classifications without reimporting.
+
+    This will:
+    1. Clear all vectors
+    2. Re-classify all messages (intent, topics)
+    3. Re-vectorize all messages
+
+    Useful when:
+    - You changed classifier/vectorizer models
+    - You fixed classifier logic (like topic extraction)
+    - Database is corrupted
+
+    Examples:
+        drecall rebuild
+        drecall rebuild --profile lite --yes
+    """
+    try:
+        # Confirmation
+        if not confirm:
+            total = typer.confirm(
+                "⚠️  Esto borrará vectores y reclasificará TODOS los mensajes. ¿Continuar?",
+                default=False
+            )
+            if not total:
+                console.print("[yellow]Operación cancelada[/yellow]")
+                return
+
+        console.print("\n[bold cyan]🔄 Rebuild: Re-clasificando y re-vectorizando...[/bold cyan]\n")
+
+        # Load config
+        if profile:
+            profile_path = Path(f"config/{profile}.yaml")
+            cfg = ConfigLoader.load(profile_path)
+            console.print(f"[dim]Usando profile: {profile}[/dim]")
+        else:
+            cfg = ConfigLoader.load(config)
+
+        # Initialize storage
+        storage_config = cfg['components']['storage']['config']
+        storage = SQLiteVectorStorage(config=storage_config)
+
+        # Get all messages
+        console.print("Cargando mensajes desde DB...")
+        import sqlite3
+        conn = sqlite3.connect(storage_config['database'])
+
+        cursor = conn.execute("SELECT COUNT(*) FROM messages")
+        total_messages = cursor.fetchone()[0]
+
+        console.print(f"Total mensajes a reprocesar: {total_messages}\n")
+
+        # Initialize classifier
+        classifier_config = cfg['components']['classifier']
+        from src.core.registry import ComponentRegistry
+        registry = ComponentRegistry()
+
+        classifier = registry.create_instance(
+            name='classifier',
+            class_path=classifier_config['class'],
+            config=classifier_config.get('config', {})
+        )
+
+        # Initialize vectorizer
+        vectorizer_config = cfg['components']['vectorizer']
+        vectorizer = registry.create_instance(
+            name='vectorizer',
+            class_path=vectorizer_config['class'],
+            config=vectorizer_config.get('config', {})
+        )
+
+        # Step 1: Re-classify
+        console.print("[bold]Step 1/3: Re-clasificando...[/bold]")
+        classifier.load()
+
+        cursor = conn.execute("SELECT id, vectorizable_content FROM messages")
+        batch_size = classifier_config.get('config', {}).get('batch_size', 32)
+
+        updates = []
+        rows = cursor.fetchall()
+
+        from rich.progress import Progress
+        with Progress() as progress:
+            task = progress.add_task("Clasificando...", total=len(rows))
+
+            for i in range(0, len(rows), batch_size):
+                batch = rows[i:i+batch_size]
+                texts = [row[1] for row in batch]
+
+                classifications = classifier.classify_batch(texts)
+
+                for (msg_id, _), classification in zip(batch, classifications):
+                    import json
+                    updates.append((
+                        classification.intent,
+                        classification.confidence,
+                        json.dumps(classification.topics),  # JSON, not str()
+                        int(classification.is_question),
+                        int(classification.is_command),
+                        msg_id
+                    ))
+
+                progress.update(task, advance=len(batch))
+
+        classifier.unload()
+
+        # Update DB
+        conn.executemany("""
+            UPDATE messages
+            SET intent = ?, intent_confidence = ?, topics = ?,
+                is_question = ?, is_command = ?
+            WHERE id = ?
+        """, updates)
+        conn.commit()
+
+        console.print(f"[green]✓[/green] {len(updates)} mensajes reclasificados\n")
+
+        # Step 2: Re-vectorize
+        console.print("[bold]Step 2/3: Re-vectorizando...[/bold]")
+        vectorizer.load()
+
+        cursor = conn.execute("SELECT id, vectorizable_content FROM messages")
+        batch_size = vectorizer_config.get('config', {}).get('batch_size', 64)
+
+        vector_updates = []
+        rows = cursor.fetchall()
+
+        import pickle
+
+        with Progress() as progress:
+            task = progress.add_task("Vectorizando...", total=len(rows))
+
+            for i in range(0, len(rows), batch_size):
+                batch = rows[i:i+batch_size]
+                texts = [row[1] for row in batch]
+
+                vectors = vectorizer.vectorize_batch(texts)
+
+                for (msg_id, _), vector in zip(batch, vectors):
+                    vector_blob = pickle.dumps(vector)
+                    vector_updates.append((vector_blob, msg_id))
+
+                progress.update(task, advance=len(batch))
+
+        vectorizer.unload()
+
+        # Update DB
+        conn.executemany("""
+            UPDATE messages SET vector = ? WHERE id = ?
+        """, vector_updates)
+        conn.commit()
+
+        console.print(f"[green]✓[/green] {len(vector_updates)} vectores regenerados\n")
+
+        # Step 3: Stats
+        console.print("[bold]Step 3/3: Verificando...[/bold]")
+        stats = storage.get_statistics()
+
+        console.print(f"\n[bold green]✓ Rebuild completado[/bold green]")
+        console.print(f"  Mensajes: {stats['total_messages']}")
+        console.print(f"  Conversaciones: {stats['total_conversations']}")
+
+        conn.close()
+
+    except Exception as e:
+        console.print(f"\n[bold red]✗ Error:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
 def version():
     """Show version information."""
     from src import __version__
