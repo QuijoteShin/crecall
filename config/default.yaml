@@ -1,0 +1,82 @@
+# config/default.yaml
+# Default configuration for DRecall
+
+# Component configuration (all swappable via interfaces)
+components:
+  # Format detection
+  format_detector:
+    class: "src.detectors.multi_pattern.MultiPatternDetector"
+
+  # Importers (tried in order)
+  importers:
+    - class: "src.importers.chatgpt.ChatGPTImporter"
+      formats: ["chatgpt", "openai"]
+      config: {}
+
+  # Content normalizer
+  normalizer:
+    class: "src.normalizers.markdown.MarkdownNormalizer"
+    config:
+      use_markitdown: true
+      fallback_on_error: true
+      preserve_code_blocks: true
+
+  # Intent classifier
+  classifier:
+    class: "src.classifiers.transformer.TransformerClassifier"
+    config:
+      model: "valhalla/distilbart-mnli-12-1"
+      batch_size: 32
+      device: "cuda"  # or "cpu"
+
+  # Text vectorizer
+  vectorizer:
+    class: "src.vectorizers.sentence_transformer.SentenceTransformerVectorizer"
+    config:
+      model: "sentence-transformers/all-MiniLM-L6-v2"
+      batch_size: 64
+      device: "cuda"  # or "cpu"
+
+  # Storage backend
+  storage:
+    class: "src.storage.sqlite_vector.SQLiteVectorStorage"
+    config:
+      database: "data/recall.db"
+
+# Pipeline configuration
+pipeline:
+  # Sequential stages (executed in order)
+  stages:
+    - name: "import"
+      components: ["format_detector", "importers"]
+
+    - name: "normalize"
+      components: ["normalizer"]
+      gc_after: false
+
+    - name: "classify"
+      components: ["classifier"]
+      gc_after: true
+      cuda_empty_cache: true
+
+    - name: "vectorize"
+      components: ["vectorizer"]
+      gc_after: true
+      cuda_empty_cache: true
+
+    - name: "persist"
+      components: ["storage"]
+
+# Memory management
+memory:
+  # Only load one GPU model at a time
+  concurrent_models: false
+
+  # Force garbage collection between stages
+  force_gc_between_stages: true
+
+  # Clear CUDA cache between GPU stages
+  cuda_empty_cache_between_stages: true
+
+  # Log memory usage
+  memory_profiling: true

@@ -1,0 +1,63 @@
+# config/lite.yaml
+# Lightweight profile - Rule-based classifier, fast loading
+
+components:
+  format_detector:
+    class: "src.detectors.multi_pattern.MultiPatternDetector"
+
+  importers:
+    - class: "src.importers.chatgpt.ChatGPTImporter"
+      formats: ["chatgpt", "openai"]
+      config: {}
+
+  normalizer:
+    class: "src.normalizers.markdown.MarkdownNormalizer"
+    config:
+      use_markitdown: true
+      fallback_on_error: true
+      preserve_code_blocks: true
+
+  # LITE: Rule-based classifier (no GPU, instant loading)
+  classifier:
+    class: "src.classifiers.rule_based.RuleBasedClassifier"
+    config: {}
+
+  # Vectorizer still uses GPU for quality
+  vectorizer:
+    class: "src.vectorizers.sentence_transformer.SentenceTransformerVectorizer"
+    config:
+      model: "sentence-transformers/all-MiniLM-L6-v2"
+      batch_size: 128  # Larger batches since no classifier GPU conflict
+      device: "cuda"
+
+  storage:
+    class: "src.storage.sqlite_vector.SQLiteVectorStorage"
+    config:
+      database: "data/recall.db"
+
+pipeline:
+  stages:
+    - name: "import"
+      components: ["format_detector", "importers"]
+
+    - name: "normalize"
+      components: ["normalizer"]
+      gc_after: false
+
+    - name: "classify"
+      components: ["classifier"]
+      gc_after: false  # Rule-based, no GPU to clear
+
+    - name: "vectorize"
+      components: ["vectorizer"]
+      gc_after: true
+      cuda_empty_cache: true
+
+    - name: "persist"
+      components: ["storage"]
+
+memory:
+  concurrent_models: false
+  force_gc_between_stages: true
+  cuda_empty_cache_between_stages: true
+  memory_profiling: true
