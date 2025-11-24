@@ -84,6 +84,8 @@ class UserConfig:
         """
         Load user configuration from .toml file.
 
+        Creates default config if it doesn't exist.
+
         Args:
             config_path: Path to config file. If None, uses .drecall/config.toml
 
@@ -91,18 +93,28 @@ class UserConfig:
             UserConfig instance
         """
         if config_path is None:
-            config_path = Path.home() / ".drecall" / "config.toml"
+            # ALWAYS use local config first (project-specific)
+            config_path = Path(".drecall/config.toml")
 
-            # If doesn't exist, try local .drecall/config.toml
+            # Fallback to home directory
             if not config_path.exists():
-                config_path = Path(".drecall/config.toml")
+                home_config = Path.home() / ".drecall" / "config.toml"
+                if home_config.exists():
+                    config_path = home_config
 
-        # If still doesn't exist, return defaults
+        # If still doesn't exist, create default config
         if not config_path.exists():
-            return cls()
+            config = cls()
+            config.save(config_path)  # Save defaults
+            return config
 
         # Load TOML
-        data = toml.load(config_path)
+        try:
+            data = toml.load(config_path)
+        except Exception as e:
+            # If corrupt, return defaults
+            print(f"Warning: Could not load config ({e}), using defaults")
+            return cls()
 
         # Parse sections
         return cls(
@@ -118,7 +130,8 @@ class UserConfig:
     def save(self, config_path: Optional[Path] = None):
         """Save configuration to file."""
         if config_path is None:
-            config_path = Path.home() / ".drecall" / "config.toml"
+            # ALWAYS save to local config (same priority as load)
+            config_path = Path(".drecall/config.toml")
 
         config_path.parent.mkdir(parents=True, exist_ok=True)
 

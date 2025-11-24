@@ -116,12 +116,13 @@ class RuleBasedClassifier(IClassifier):
     def _extract_topics(self, text: str, max_topics: int = 5) -> List[str]:
         """Simple topic extraction using frequency."""
         # Remove punctuation and lowercase
-        words = re.findall(r'\b[a-zA-Z]{4,}\b', text.lower())
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())  # 3+ chars to catch SQL, API, CSS, etc.
 
         # Ultra minimal stopwords (ADR-compliant)
         ultra_stopwords = {
             'this', 'that', 'these', 'those', 'what', 'which', 'who',
-            'have', 'been', 'were', 'said', 'from', 'they', 'with'
+            'have', 'been', 'were', 'said', 'from', 'they', 'with',
+            'the', 'and', 'for', 'not', 'but', 'you', 'all', 'can'  # Common 3-letter words
         }
         words = [w for w in words if w not in ultra_stopwords]
 

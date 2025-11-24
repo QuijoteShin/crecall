@@ -95,15 +95,25 @@ def init(
 def search(
     query: str = typer.Argument(..., help="Search query"),
     limit: int = typer.Option(10, "--limit", "-n", help="Number of results"),
-    mode: str = typer.Option("vector", "--mode", "-m", help="Search mode: vector, text, or hybrid"),
+    mode: str = typer.Option("vector", "--mode", "-m", help="Search mode: vector, text, topic"),
     config: Optional[Path] = typer.Option(None, "--config", "-c", help="Custom config file"),
 ):
     """
     Search indexed messages.
 
+    Search Modes:
+        vector - Semantic search (default, hybrid with keyword boost)
+        text   - Full-text keyword search
+        topic  - Search by topic tags
+
+    Special Syntax:
+        ..topico..  - Auto-detect topic search (e.g., ..energía..)
+        @file.pdf   - Search in file context
+
     Examples:
         drecall search "how to implement authentication"
         drecall search "python async" --limit 20
+        drecall search "..energía.." --mode topic
         drecall search "error handling" --mode text
     """
     try:
@@ -114,12 +124,65 @@ def search(
         storage_config = cfg['components']['storage']['config']
         storage = SQLiteVectorStorage(config=storage_config)
 
-        if mode == "text":
+        # Auto-detect topic search syntax: ..topic..
+        import re
+        topic_match = re.search(r'\.\.([^.]+)\.\.', query)
+
+        if topic_match:
+            topic_filter = topic_match.group(1)
+            # Remove topic syntax from query
+            query_without_topic = re.sub(r'\.\.([^.]+)\.\.', '', query).strip()
+
+            if query_without_topic:
+                # Mixed search: semantic + topic filter
+                console.print(f"[dim]Búsqueda mixta: '{query_without_topic}' en tópico '{topic_filter}'[/dim]")
+
+                # Get vectorizer
+                vectorizer_config = cfg['components']['vectorizer']['config']
+                vectorizer = SentenceTransformerVectorizer(config=vectorizer_config)
+                vectorizer.load()
+
+                query_vector = vectorizer.vectorize(query_without_topic)
+
+                # Get topic results first
+                topic_results = storage.search_by_topic(topic_filter, limit=1000)
+
+                # Rank by semantic similarity
+                import numpy as np
+                for result in topic_results:
+                    if result.message.vector is not None:
+                        similarity = float(np.dot(query_vector, result.message.vector))
+                        result.score = (result.score * 0.3) + (similarity * 0.7)
+                        result.matched_on = 'mixed'
+
+                # Sort and limit
+                topic_results.sort(key=lambda x: x.score, reverse=True)
+                results = topic_results[:limit]
+
+                vectorizer.unload()
+
+            else:
+                # Pure topic search
+                console.print(f"[dim]Buscando tópico: {topic_filter}[/dim]")
+                results = storage.search_by_topic(topic_filter, limit=limit)
+
+            # Show matched topics in results
+            for result in results:
+                matched_topics = result.metadata.get('matched_topics', [])
+                if matched_topics:
+                    result.snippet = f"Tópicos: {', '.join(matched_topics)}"
+
+        elif mode == "topic":
+            # Explicit topic mode
+            console.print(f"[dim]Buscando tópico: {query}[/dim]")
+            results = storage.search_by_topic(query, limit=limit)
+
+        elif mode == "text":
             # Text search
             results = storage.search_by_text(query, limit=limit)
 
         elif mode == "vector":
-            # Vector search - need to vectorize query first
+            # Hybrid search (vector + keyword boosting)
             console.print("[dim]Initializing vectorizer...[/dim]")
 
             vectorizer_config = cfg['components']['vectorizer']['config']
@@ -127,7 +190,14 @@ def search(
             vectorizer.load()
 
             query_vector = vectorizer.vectorize(query)
-            results = storage.search_by_vector(query_vector, limit=limit)
+
+            # Hybrid search: vector similarity + keyword boosting
+            results = storage.search_by_vector(
+                query_vector,
+                limit=limit,
+                query_text=query,  # Enable hybrid boosting
+                hybrid_boost=0.3  # 30% boost for exact keyword matches
+            )
 
             vectorizer.unload()
 
@@ -147,7 +217,15 @@ def search(
             score = result.score
 
             console.print(f"[cyan]{i}. Score: {score:.3f}[/cyan]")
-            console.print(f"   Conversation: {msg.normalized.conversation_id}")
+
+            # Show matched topics for topic search
+            if result.matched_on == 'topic' and result.metadata.get('matched_topics'):
+                matched = ', '.join(result.metadata['matched_topics'])
+                all_topics = ', '.join(result.metadata.get('all_topics', []))
+                console.print(f"   Matched Topics: [yellow]{matched}[/yellow]")
+                console.print(f"   All Topics: [dim]{all_topics}[/dim]")
+
+            console.print(f"   Conversation: {msg.normalized.metadata.get('conversation_title', msg.normalized.conversation_id[:20])}")
             console.print(f"   Author: {msg.normalized.author_role}")
             console.print(f"   Intent: {msg.classification.intent} ({msg.classification.confidence:.2f})")
             console.print(f"   Timestamp: {msg.normalized.timestamp}")

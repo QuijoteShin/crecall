@@ -186,6 +186,7 @@ data/*.db-journal
 data/*.db-wal
 data/*.log
 data/memory_profile.log
+data/exports/
 
 # Input files (user's private data)
 process/in/*
@@ -197,4 +198,5 @@ process/staging/*
 
 # User-specific config
 .drecall/config.toml
+.drecall/search_history.txt
 .drecall/sessions/

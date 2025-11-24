@@ -248,9 +248,20 @@ class SQLiteVectorStorage(IStorage):
         self,
         query_vector: np.ndarray,
         limit: int = 10,
-        filters: Optional[dict] = None
+        filters: Optional[dict] = None,
+        query_text: Optional[str] = None,
+        hybrid_boost: float = 0.3
     ) -> List[SearchResult]:
-        """Vector similarity search."""
+        """
+        Vector similarity search with optional hybrid boosting.
+
+        Args:
+            query_vector: Embedding vector
+            limit: Max results
+            filters: Optional filters
+            query_text: Original query text (for hybrid search)
+            hybrid_boost: Boost factor for exact keyword matches (0.0-1.0)
+        """
         conn = self._connect()
 
         # Build filter WHERE clause
@@ -274,27 +285,164 @@ class SQLiteVectorStorage(IStorage):
         """, params)
 
         results = []
+        keywords = self._extract_keywords(query_text) if query_text else []
+
         for row in cursor:
             # Deserialize vector
             stored_vector = pickle.loads(row['vector'])
 
             # Calculate cosine similarity (vectors are normalized)
-            similarity = float(np.dot(query_vector, stored_vector))
+            vector_score = float(np.dot(query_vector, stored_vector))
+
+            # Hybrid boosting: check for exact keyword matches
+            keyword_boost = 0.0
+            if keywords and hybrid_boost > 0:
+                content_lower = row['vectorizable_content'].lower()
+
+                for keyword in keywords:
+                    if keyword.lower() in content_lower:
+                        # Boost per keyword found
+                        keyword_boost += hybrid_boost / len(keywords)
+
+            # Combined score
+            final_score = min(1.0, vector_score + keyword_boost)
 
             # Reconstruct ProcessedMessage
             message = self._row_to_processed_message(row)
 
             results.append(SearchResult(
                 message=message,
-                score=similarity,
+                score=final_score,
                 rank=0,  # Will be set after sorting
-                matched_on='vector'
+                matched_on='hybrid' if keyword_boost > 0 else 'vector',
+                metadata={
+                    'vector_score': vector_score,
+                    'keyword_boost': keyword_boost,
+                    'keywords_found': [k for k in keywords if k.lower() in row['vectorizable_content'].lower()]
+                }
             ))
 
-        # Sort by similarity
+        # Sort by combined score
         results.sort(key=lambda x: x.score, reverse=True)
 
         # Set ranks and limit
+        for i, result in enumerate(results[:limit], 1):
+            result.rank = i
+
+        return results[:limit]
+
+    def _extract_keywords(self, query_text: Optional[str]) -> List[str]:
+        """
+        Extract meaningful keywords from query.
+
+        Removes stopwords but keeps proper nouns and important terms.
+        """
+        if not query_text:
+            return []
+
+        import re
+
+        # Split into words
+        words = re.findall(r'\b\w+\b', query_text.lower())
+
+        # Ultra-minimal stopwords (keep proper nouns)
+        stopwords = {
+            'es', 'de', 'la', 'el', 'en', 'y', 'a', 'que', 'los', 'las',
+            'un', 'una', 'por', 'para', 'con', 'del', 'al',
+            'is', 'the', 'of', 'and', 'to', 'in', 'for', 'with'
+        }
+
+        # Keep words longer than 3 chars or proper nouns (capitalized in original)
+        keywords = [
+            w for w in words
+            if len(w) > 3 or w not in stopwords
+        ]
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_keywords = []
+        for kw in keywords:
+            if kw not in seen:
+                seen.add(kw)
+                unique_keywords.append(kw)
+
+        return unique_keywords
+
+    def search_by_topic(
+        self,
+        topic_query: str,
+        limit: int = 10,
+        use_similarity: bool = True
+    ) -> List[SearchResult]:
+        """
+        Search by topic keywords.
+
+        Args:
+            topic_query: Topic to search for
+            limit: Max results
+            use_similarity: If True, also match similar topics (fuzzy)
+
+        Returns:
+            List of SearchResult objects
+        """
+        conn = self._connect()
+
+        # Normalize topic query
+        topic_lower = topic_query.lower().strip()
+
+        results = []
+
+        # Fetch all messages
+        cursor = conn.execute("""
+            SELECT * FROM messages
+            WHERE topics != '[]'
+        """)
+
+        for row in cursor:
+            topics = json.loads(row['topics'])
+
+            # Check for exact or partial match
+            match_score = 0.0
+
+            for topic in topics:
+                topic_clean = topic.lower()
+
+                # Exact match
+                if topic_clean == topic_lower:
+                    match_score = 1.0
+                    break
+
+                # Partial match (contains)
+                elif topic_lower in topic_clean or topic_clean in topic_lower:
+                    match_score = max(match_score, 0.8)
+
+                # Fuzzy similarity (simple)
+                elif use_similarity:
+                    # Calculate overlap ratio
+                    common_chars = set(topic_lower) & set(topic_clean)
+                    if common_chars:
+                        similarity = len(common_chars) / max(len(topic_lower), len(topic_clean))
+                        if similarity > 0.5:
+                            match_score = max(match_score, similarity * 0.6)
+
+            if match_score > 0:
+                message = self._row_to_processed_message(row)
+
+                results.append(SearchResult(
+                    message=message,
+                    score=match_score,
+                    rank=0,
+                    matched_on='topic',
+                    metadata={
+                        'matched_topics': [t for t in topics if topic_lower in t.lower()],
+                        'all_topics': topics
+                    }
+                ))
+
+        # Sort by score
+        results.sort(key=lambda x: x.score, reverse=True)
+
+        # Set ranks
         for i, result in enumerate(results[:limit], 1):
             result.rank = i
 
