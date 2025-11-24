@@ -1,0 +1,47 @@
+# .drecall/config.toml.example
+# User-specific configuration for DRecall Interactive
+# Copy to .drecall/config.toml and customize
+
+[personality]
+name = "CognitiveAssistant"
+style = "technical"  # technical, casual, formal
+language = "es"  # es, en, multilingual
+response_length = "concise"  # concise, detailed, verbose
+
+[prompts]
+search_intro = "Encontré estas conversaciones relacionadas:"
+no_results = "No encontré nada relevante. ¿Quieres reformular la búsqueda?"
+loading = "Buscando en tu memoria cognitiva..."
+welcome = "DRecall v{version} | {total_messages} mensajes indexados"
+
+[memory]
+# Context management (HCS - Hierarchical Context System)
+context_window = 5  # Últimos N tópicos activos
+max_scroll_cache = 100  # Mensajes en memoria durante scroll
+auto_expand = true  # Cargar más resultados al llegar al final
+
+[search]
+default_limit = 5
+min_similarity = 0.3  # Threshold mínimo de relevancia
+auto_highlight = true  # Resaltar términos de búsqueda
+show_scores = true
+
+[ui]
+# Terminal UI settings
+theme = "dark"  # dark, light, auto
+result_preview_lines = 3  # Líneas de preview por resultado
+show_metadata = true  # Mostrar timestamp, intent, etc.
+keyboard_shortcuts = true
+
+[ai_connections]
+# External AI services (optional)
+# gemini_api_key = ""
+# chatgpt_api_key = ""
+# claude_api_key = ""
+
+[attachments]
+# File handling
+index_images = true
+index_pdfs = true
+ocr_enabled = false  # OCR para imágenes (requiere tesseract)
+max_file_size_mb = 50

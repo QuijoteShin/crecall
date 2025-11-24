@@ -306,6 +306,25 @@ def reindex(
 
 
 @app.command()
+def interactive():
+    """
+    Launch interactive TUI (Terminal User Interface).
+
+    Features:
+    - REPL-style search interface
+    - Numbered results [1-5] with keyboard navigation
+    - Slash commands (/connect, /files, @file)
+    - State management (ESC returns without losing context)
+    - Lazy loading for efficiency
+
+    Examples:
+        drecall interactive
+    """
+    from src.tui.app import run_interactive
+    run_interactive()
+
+
+@app.command()
 def version():
     """Show version information."""
     from src import __version__

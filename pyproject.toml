@@ -25,6 +25,11 @@ dependencies = [
     "numpy>=1.24.0",
     "pyyaml>=6.0",
     "rich>=13.0.0",
+    "toml>=0.10.2",
+
+    # Interactive TUI
+    "textual>=0.47.0",
+    "prompt-toolkit>=3.0.0",
 
     # Normalization (swappable via INormalizer interface)
     "markitdown>=0.1.0",
@@ -51,7 +56,8 @@ dev = [
 ]
 
 [project.scripts]
-drecall = "drecall.cli.main:app"
+drecall = "src.cli.main:app"
+drecall-tui = "src.tui.app:run_interactive"
 
 [tool.setuptools.packages.find]
 where = ["."]
