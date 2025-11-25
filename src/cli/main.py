@@ -1,5 +1,5 @@
 # src/cli/main.py
-"""DRecall CLI application."""
+"""Chat Recall (crec) - Deep Research Chat Recall CLI."""
 
 from pathlib import Path
 from typing import Optional
@@ -19,8 +19,8 @@ from src.storage.sqlite_vector import SQLiteVectorStorage
 from src.vectorizers.sentence_transformer import SentenceTransformerVectorizer
 
 app = typer.Typer(
-    name="drecall",
-    help="Tech-agnostic cognitive RAG system for document and chat history",
+    name="crec",
+    help="Chat Recall - Deep Research Chat Recall",
     add_completion=False,
 )
 console = Console()
@@ -306,11 +306,207 @@ def reindex(
 
 
 @app.command()
+def interactive():
+    """
+    Launch interactive TUI (Terminal User Interface).
+
+    Features:
+    - REPL-style search interface with Vector First strategy
+    - Numbered results [1-5] with keyboard navigation
+    - Slash commands (/stats, /help, /theme)
+    - Topic search: ..topic.. or query ..topic..
+    - ESC returns without losing context
+    """
+    from src.tui.app import run_interactive
+    run_interactive()
+
+
+@app.command()
+def rebuild(
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Custom config file"),
+    profile: Optional[str] = typer.Option(None, "--profile", "-p", help="Config profile"),
+    confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+    vectors_only: bool = typer.Option(False, "--vectors-only", "-v", help="Only re-vectorize, skip classification"),
+    resume: bool = typer.Option(True, "--resume/--no-resume", help="Resume from checkpoint (skip already converted)"),
+):
+    """
+    Rebuild vectors and/or classifications without reimporting.
+
+    Features:
+        --resume (default): Detects already-converted vectors by dimension and skips them
+        --no-resume: Force re-vectorize all messages
+
+    Examples:
+        crec rebuild --vectors-only --yes
+        crec rebuild --vectors-only --yes --no-resume
+    """
+    import pickle
+    import sqlite3
+    try:
+        if not confirm:
+            total = typer.confirm(
+                "This will rebuild vectors/classifications. Continue?",
+                default=False
+            )
+            if not total:
+                console.print("[yellow]Cancelled[/yellow]")
+                return
+
+        console.print("\n[bold cyan]Rebuild: Re-vectorizing...[/bold cyan]\n")
+
+        if profile:
+            profile_path = Path(f"config/{profile}.yaml")
+            cfg = ConfigLoader.load(profile_path)
+            console.print(f"[dim]Using profile: {profile}[/dim]")
+        else:
+            cfg = ConfigLoader.load(config)
+
+        storage_config = cfg['components']['storage']['config']
+        storage = SQLiteVectorStorage(config=storage_config)
+
+        console.print("Loading messages...")
+        conn = sqlite3.connect(storage_config['database'])
+
+        cursor = conn.execute("SELECT COUNT(*) FROM messages")
+        total_messages = cursor.fetchone()[0]
+        console.print(f"Total messages: {total_messages}\n")
+
+        registry = ComponentRegistry()
+
+        # Skip classification if --vectors-only
+        if not vectors_only:
+            classifier_config = cfg['components']['classifier']
+            classifier = registry.create_instance(
+                name='classifier',
+                class_path=classifier_config['class'],
+                config=classifier_config.get('config', {})
+            )
+
+            console.print("[bold]Step 1/2: Re-classifying...[/bold]")
+            classifier.load()
+
+            cursor = conn.execute("SELECT id, vectorizable_content FROM messages")
+            batch_size = classifier_config.get('config', {}).get('batch_size', 32)
+            rows = cursor.fetchall()
+
+            from rich.progress import Progress
+            import json
+            with Progress() as progress:
+                task = progress.add_task("Classifying...", total=len(rows))
+                updates = []
+
+                for i in range(0, len(rows), batch_size):
+                    batch = rows[i:i+batch_size]
+                    texts = [row[1] for row in batch]
+                    classifications = classifier.classify_batch(texts)
+
+                    for (msg_id, _), classification in zip(batch, classifications):
+                        updates.append((
+                            classification.intent,
+                            classification.confidence,
+                            json.dumps(classification.topics),
+                            int(classification.is_question),
+                            int(classification.is_command),
+                            msg_id
+                        ))
+                    progress.update(task, advance=len(batch))
+
+            classifier.unload()
+
+            conn.executemany("""
+                UPDATE messages
+                SET intent = ?, intent_confidence = ?, topics = ?, is_question = ?, is_command = ?
+                WHERE id = ?
+            """, updates)
+            conn.commit()
+            console.print(f"[green]✓[/green] {len(updates)} messages reclassified\n")
+            step_prefix = "Step 2/2"
+        else:
+            console.print("[dim]Skipping classification (--vectors-only)[/dim]\n")
+            step_prefix = "Step 1/1"
+
+        # Vectorize
+        vectorizer_config = cfg['components']['vectorizer']
+        vectorizer = registry.create_instance(
+            name='vectorizer',
+            class_path=vectorizer_config['class'],
+            config=vectorizer_config.get('config', {})
+        )
+
+        console.print(f"[bold]{step_prefix}: Re-vectorizing...[/bold]")
+        vectorizer.load()
+
+        target_dim = vectorizer.get_embedding_dim()
+        batch_size = vectorizer_config.get('config', {}).get('batch_size', 64)
+
+        # Checkpoint support
+        if resume:
+            console.print(f"[dim]Checkpoint: finding messages without {target_dim}d vectors...[/dim]")
+            cursor = conn.execute("SELECT id, vectorizable_content, vector FROM messages")
+            all_rows = cursor.fetchall()
+
+            rows = []
+            already_done = 0
+            for row in all_rows:
+                msg_id, content, vector_blob = row
+                if vector_blob:
+                    try:
+                        existing_vector = pickle.loads(vector_blob)
+                        if len(existing_vector) == target_dim:
+                            already_done += 1
+                            continue
+                    except:
+                        pass
+                rows.append((msg_id, content))
+
+            if already_done > 0:
+                console.print(f"[green]✓[/green] {already_done} messages already have {target_dim}d vectors (skipped)")
+
+            if not rows:
+                console.print("[green]✓[/green] All messages already have correct vectors")
+                vectorizer.unload()
+                conn.close()
+                return
+        else:
+            cursor = conn.execute("SELECT id, vectorizable_content FROM messages")
+            rows = cursor.fetchall()
+
+        total = len(rows)
+        console.print(f"Messages to vectorize: {total}")
+
+        processed = 0
+        for i in range(0, total, batch_size):
+            batch = rows[i:i+batch_size]
+            texts = [row[1] for row in batch]
+            vectors = vectorizer.vectorize_batch(texts)
+
+            updates = []
+            for (msg_id, _), vector in zip(batch, vectors):
+                updates.append((pickle.dumps(vector), msg_id))
+
+            conn.executemany("UPDATE messages SET vector = ? WHERE id = ?", updates)
+            conn.commit()
+
+            processed += len(batch)
+            console.print(f"  Vectorized: {processed}/{total} ({100*processed/total:.0f}%)")
+
+        vectorizer.unload()
+        console.print(f"[green]✓[/green] {total} vectors regenerated\n")
+
+        console.print("[bold green]✓ Rebuild complete[/bold green]")
+        conn.close()
+
+    except Exception as e:
+        console.print(f"\n[bold red]✗ Error:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
 def version():
     """Show version information."""
-    from src import __version__
-    console.print(f"DRecall version {__version__}")
-    console.print("Tech-agnostic cognitive RAG system")
+    from src import __version__, __full_name__
+    console.print(f"{__full_name__} (crec) v{__version__}")
+    console.print("Deep Research Chat Recall")
 
 
 if __name__ == "__main__":

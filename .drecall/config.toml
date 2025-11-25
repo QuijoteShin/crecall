@@ -1,0 +1,36 @@
+[personality]
+name = "CognitiveAssistant"
+style = "technical"
+language = "es"
+response_length = "concise"
+
+[prompts]
+search_intro = "Encontré estas conversaciones relacionadas:"
+no_results = "No encontré nada relevante. ¿Quieres reformular la búsqueda?"
+loading = "Buscando en tu memoria cognitiva..."
+welcome = "DRecall v{version} | {total_messages} mensajes indexados"
+
+[memory]
+context_window = 5
+max_scroll_cache = 100
+auto_expand = true
+
+[search]
+default_limit = 5
+min_similarity = 0.3
+auto_highlight = true
+show_scores = true
+
+[ui]
+theme = "light"
+result_preview_lines = 3
+show_metadata = true
+keyboard_shortcuts = true
+
+[ai_connections]
+
+[attachments]
+index_images = true
+index_pdfs = true
+ocr_enabled = false
+max_file_size_mb = 50

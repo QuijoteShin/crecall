@@ -1,4 +1,6 @@
 # src/__init__.py
-"""DRecall - Tech-agnostic cognitive RAG system."""
+"""Chat Recall (crec) - Deep Research Chat Recall."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+__app_name__ = "crec"
+__full_name__ = "Chat Recall"
