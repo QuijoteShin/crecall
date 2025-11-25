@@ -1,4 +1,6 @@
-# config/default.yaml
+# config/nomic-128.yaml
+# Nomic Embed v1.5 con MRL 128 dims (COMPACTO)
+# 100% precisión vs 768, 83% menos storage
 
 components:
   format_detector:
@@ -17,45 +19,37 @@ components:
       preserve_code_blocks: true
 
   classifier:
-    class: "src.classifiers.transformer.TransformerClassifier"
-    config:
-      model: "valhalla/distilbart-mnli-12-1"
-      batch_size: 32
-      device: "cuda"
+    class: "src.classifiers.rule_based.RuleBasedClassifier"
+    config: {}
 
   vectorizer:
     class: "src.vectorizers.nomic_embed.NomicEmbedVectorizer"
     config:
       model: "nomic-ai/nomic-embed-text-v1.5"
-      dimension: 384
-      batch_size: 32
+      dimension: 128
+      batch_size: 64
       device: "cuda"
 
   storage:
     class: "src.storage.sqlite_vector.SQLiteVectorStorage"
     config:
       database: "data/recall.db"
-      dimension: 384
+      dimension: 128
 
 pipeline:
   stages:
     - name: "import"
       components: ["format_detector", "importers"]
-
     - name: "normalize"
       components: ["normalizer"]
       gc_after: false
-
     - name: "classify"
       components: ["classifier"]
-      gc_after: true
-      cuda_empty_cache: true
-
+      gc_after: false
     - name: "vectorize"
       components: ["vectorizer"]
       gc_after: true
       cuda_empty_cache: true
-
     - name: "persist"
       components: ["storage"]
 

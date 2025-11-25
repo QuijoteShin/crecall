@@ -114,17 +114,26 @@ class RuleBasedClassifier(IClassifier):
         )
 
     def _extract_topics(self, text: str, max_topics: int = 5) -> List[str]:
-        """Simple topic extraction using frequency."""
-        # Remove punctuation and lowercase
-        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())  # 3+ chars to catch SQL, API, CSS, etc.
+        """
+        Extrae tópicos preservando acrónimos (SQL, API, AWS).
+        """
+        # Extraer palabras preservando case original
+        words_raw = re.findall(r'\b\w+\b', text)
 
-        # Ultra minimal stopwords (ADR-compliant)
-        ultra_stopwords = {
+        # Stopwords expandido
+        stopwords = {
             'this', 'that', 'these', 'those', 'what', 'which', 'who',
             'have', 'been', 'were', 'said', 'from', 'they', 'with',
-            'the', 'and', 'for', 'not', 'but', 'you', 'all', 'can'  # Common 3-letter words
+            'the', 'and', 'for', 'not', 'but', 'you', 'all', 'can',
+            'are', 'was', 'will', 'would', 'could', 'should', 'may',
+            'es', 'de', 'la', 'el', 'en', 'que', 'los', 'las', 'una', 'del'
         }
-        words = [w for w in words if w not in ultra_stopwords]
+
+        # Filtrar: preserva acrónimos (mayúsculas completas) o palabras > 2 chars
+        words = [
+            w.lower() for w in words_raw
+            if w.lower() not in stopwords and (len(w) > 2 or w.isupper())
+        ]
 
         # Count frequency
         word_counts = Counter(words)

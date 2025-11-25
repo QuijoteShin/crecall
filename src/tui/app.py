@@ -8,6 +8,7 @@ from textual.binding import Binding
 from textual.reactive import reactive
 from rich.text import Text
 from rich.markdown import Markdown
+from rich.markup import escape
 from pathlib import Path
 from datetime import datetime
 import sys
@@ -19,7 +20,6 @@ from src.core.config import ConfigLoader
 from src.core.user_config import UserConfig
 from src.core.registry import ComponentRegistry
 from src.storage.sqlite_vector import SQLiteVectorStorage
-from src.vectorizers.sentence_transformer import SentenceTransformerVectorizer
 from src import __version__
 
 
@@ -36,25 +36,31 @@ class SearchResultItem(ListItem):
         msg = result.message
         score = result.score
 
-        # Build label
-        lines = []
-        lines.append(f"[{rank}] ⭐ {score:.3f} - {msg.normalized.metadata.get('conversation_title', 'Untitled')}")
-        lines.append(f"    {msg.classification.intent} | {msg.normalized.timestamp.strftime('%Y-%m-%d %H:%M')}")
+        # Build label using Text object (safer than string markup)
+        content = Text()
 
-        # Show more content (500 chars instead of 200)
+        # Header line
+        title = msg.normalized.metadata.get('conversation_title', 'Untitled')
+        content.append(f"[{rank}] ", style="bold cyan")
+        content.append(f"⭐ {score:.3f} ", style="yellow")
+        content.append(f"- {title}\n")
+
+        # Intent and timestamp
+        content.append(f"    {msg.classification.intent}", style="dim")
+        content.append(f" | {msg.normalized.timestamp.strftime('%Y-%m-%d %H:%M')}\n", style="dim")
+
+        # Preview content
         preview = msg.clean_content[:500]
         if len(msg.clean_content) > 500:
             preview += "..."
+        content.append(f"    {preview}\n")
 
-        # Split into lines for better readability
-        lines.append(f"    {preview}")
-
-        # Show keywords if hybrid search
+        # Keywords if hybrid search
         if result.matched_on == 'hybrid' and result.metadata.get('keywords_found'):
             keywords = ', '.join(result.metadata['keywords_found'])
-            lines.append(f"    [dim]Keywords: {keywords}[/dim]")
+            content.append(f"    Keywords: {keywords}", style="dim")
 
-        self._label = Label("\n".join(lines))
+        self._label = Static(content)
 
     def compose(self) -> ComposeResult:
         yield self._label
@@ -294,106 +300,159 @@ class DRecallApp(App):
         # Focus results after search
         self.query_one("#results-list").focus()
 
-    async def perform_mixed_search(self, query: str, topic_filter: str):
+    async def perform_mixed_search(self, query: str, topic_hint: str):
         """
-        Mixed search: semantic search + topic filtering.
+        Mixed search: VECTOR FIRST, topics as bonus (not filter).
 
-        Example: "bintel ..sass.." → Search for "bintel" in messages with topic "sass"
+        Strategy: "Vector Truth"
+        - Combine query + topic_hint into semantic search
+        - Find by meaning, not by tags
+        - Add bonus for topic tag matches (highlighting)
+
+        Example: "bintel ..sql.." → Search "bintel sql" semantically
         """
         status_bar = self.query_one("#status-bar", Static)
         results_list = self.query_one("#results-list", ListView)
 
-        status_bar.update(f"Buscando '{query}' en tópico '{topic_filter}'...")
+        # Combine query with topic hint for richer semantic search
+        semantic_query = f"{query} {topic_hint}"
+        status_bar.update(f"Buscando '{semantic_query}' (vector first)...")
 
-        # Initialize vectorizer
         if self.vectorizer is None:
-            vectorizer_config = self.system_config['components']['vectorizer']['config']
-            self.vectorizer = SentenceTransformerVectorizer(config=vectorizer_config)
+            vectorizer_cfg = self.system_config['components']['vectorizer']
+            registry = ComponentRegistry()
+            self.vectorizer = registry.create_instance(
+                name='vectorizer',
+                class_path=vectorizer_cfg['class'],
+                config=vectorizer_cfg.get('config', {})
+            )
             self.vectorizer.load()
 
-        # Vectorize query
-        query_vector = self.vectorizer.vectorize(query)
+        # Vectorize the combined semantic query
+        if hasattr(self.vectorizer, 'vectorize_query'):
+            query_vector = self.vectorizer.vectorize_query(semantic_query)
+        else:
+            query_vector = self.vectorizer.vectorize(semantic_query)
 
-        # Get all results for the topic
-        topic_results = self.storage.search_by_topic(
-            topic_filter,
-            limit=1000  # Get many to have pool for semantic ranking
+        # VECTOR FIRST: Search by meaning, with keyword bonus
+        results = self.storage.search_by_vector(
+            query_vector,
+            limit=self.user_config.search.default_limit * 3,
+            query_text=semantic_query,
+            hybrid_boost=0.3
         )
 
-        if not topic_results:
-            status_bar.update(f"No se encontraron mensajes con tópico '{topic_filter}'")
-            results_list.clear()
-            return
-
-        # Rank by semantic similarity
+        # Add bonus for topic tag matches (highlighting, not filtering)
         import numpy as np
-        ranked_results = []
+        topic_lower = topic_hint.lower()
 
-        for result in topic_results:
-            if result.message.vector is not None:
-                # Calculate similarity
-                similarity = float(np.dot(query_vector, result.message.vector))
+        for result in results:
+            topics = result.message.classification.topics
+            topic_bonus = 0.0
 
-                # Update score (blend topic match + semantic)
-                result.score = (result.score * 0.3) + (similarity * 0.7)
+            for topic in topics:
+                if topic_lower in topic.lower() or topic.lower() in topic_lower:
+                    topic_bonus = 0.15
+                    break
+
+            if topic_bonus > 0:
+                result.score = min(1.0, result.score + topic_bonus)
                 result.matched_on = 'mixed'
-                result.metadata['semantic_score'] = similarity
-                result.metadata['topic_score'] = result.score
+                result.metadata['topic_bonus'] = topic_bonus
+                result.metadata['matched_topics'] = [t for t in topics if topic_lower in t.lower()]
 
-                ranked_results.append(result)
-
-        # Sort by new score
-        ranked_results.sort(key=lambda x: x.score, reverse=True)
+        # Re-sort after topic bonus
+        results.sort(key=lambda x: x.score, reverse=True)
 
         # Filter by min similarity
-        ranked_results = [
-            r for r in ranked_results
-            if r.metadata.get('semantic_score', 0) >= self.user_config.search.min_similarity
+        results = [
+            r for r in results
+            if r.score >= self.user_config.search.min_similarity
         ]
 
         # Limit
-        ranked_results = ranked_results[:self.user_config.search.default_limit * 2]
+        results = results[:self.user_config.search.default_limit * 2]
 
         # Update ranks
-        for i, result in enumerate(ranked_results, 1):
+        for i, result in enumerate(results, 1):
             result.rank = i
-
-        self.current_results = ranked_results
-        results_list.clear()
-
-        if not ranked_results:
-            status_bar.update(f"No hay resultados relevantes para '{query}' en tópico '{topic_filter}'")
-            return
-
-        status_bar.update(
-            f"'{query}' en ..{topic_filter}.. ({len(ranked_results)} resultados) | Tab=navegar"
-        )
-
-        for i, result in enumerate(ranked_results, 1):
-            results_list.append(SearchResultItem(result, i))
-
-    async def perform_topic_search(self, topic_query: str):
-        """Search by topic tags."""
-        status_bar = self.query_one("#status-bar", Static)
-        results_list = self.query_one("#results-list", ListView)
-
-        status_bar.update(f"Buscando tópico: {topic_query}...")
-
-        # Topic search (no vectorizer needed)
-        results = self.storage.search_by_topic(
-            topic_query,
-            limit=self.user_config.search.default_limit * 2  # More results for topic search
-        )
 
         self.current_results = results
         results_list.clear()
 
         if not results:
-            status_bar.update(f"No se encontraron mensajes con tópico '{topic_query}'")
+            status_bar.update(f"No hay resultados para '{semantic_query}'")
             return
 
         status_bar.update(
-            f"Encontrados {len(results)} mensajes con tópico '{topic_query}' | Tab=navegar, Enter=ver"
+            f"'{query}' ..{topic_hint}.. ({len(results)} resultados) | Vector First | Tab=navegar"
+        )
+
+        for i, result in enumerate(results, 1):
+            results_list.append(SearchResultItem(result, i))
+
+    async def perform_topic_search(self, topic_query: str):
+        """
+        Topic search: VECTOR FIRST strategy.
+
+        ..sql.. now searches semantically for "sql" meaning,
+        not just messages with "sql" in their tags.
+        """
+        status_bar = self.query_one("#status-bar", Static)
+        results_list = self.query_one("#results-list", ListView)
+
+        status_bar.update(f"Buscando ..{topic_query}.. (vector first)...")
+
+        # Load vectorizer
+        if self.vectorizer is None:
+            vectorizer_cfg = self.system_config['components']['vectorizer']
+            registry = ComponentRegistry()
+            self.vectorizer = registry.create_instance(
+                name='vectorizer',
+                class_path=vectorizer_cfg['class'],
+                config=vectorizer_cfg.get('config', {})
+            )
+            self.vectorizer.load()
+
+        # Vectorize the topic as semantic query
+        if hasattr(self.vectorizer, 'vectorize_query'):
+            query_vector = self.vectorizer.vectorize_query(topic_query)
+        else:
+            query_vector = self.vectorizer.vectorize(topic_query)
+
+        # VECTOR FIRST: Search by meaning
+        results = self.storage.search_by_vector(
+            query_vector,
+            limit=self.user_config.search.default_limit * 2,
+            query_text=topic_query,
+            hybrid_boost=0.3
+        )
+
+        # Add bonus for topic tag matches
+        topic_lower = topic_query.lower()
+        for result in results:
+            topics = result.message.classification.topics
+            for topic in topics:
+                if topic_lower in topic.lower() or topic.lower() in topic_lower:
+                    result.score = min(1.0, result.score + 0.15)
+                    result.metadata['matched_topics'] = [t for t in topics if topic_lower in t.lower()]
+                    break
+
+        # Re-sort after bonus
+        results.sort(key=lambda x: x.score, reverse=True)
+
+        # Filter by min similarity
+        results = [r for r in results if r.score >= self.user_config.search.min_similarity]
+
+        self.current_results = results
+        results_list.clear()
+
+        if not results:
+            status_bar.update(f"No hay resultados para ..{topic_query}..")
+            return
+
+        status_bar.update(
+            f"..{topic_query}.. ({len(results)} resultados) | Vector First | Tab=navegar"
         )
 
         for i, result in enumerate(results, 1):
@@ -414,15 +473,21 @@ class DRecallApp(App):
         # Show loading
         status_bar.update(self.user_config.prompts.loading)
 
-        # Initialize vectorizer if needed
         if self.vectorizer is None:
-            vectorizer_config = self.system_config['components']['vectorizer']['config']
-            self.vectorizer = SentenceTransformerVectorizer(config=vectorizer_config)
+            vectorizer_cfg = self.system_config['components']['vectorizer']
+            registry = ComponentRegistry()
+            self.vectorizer = registry.create_instance(
+                name='vectorizer',
+                class_path=vectorizer_cfg['class'],
+                config=vectorizer_cfg.get('config', {})
+            )
             self.vectorizer.load()
             status_bar.update("Vectorizer cargado. Buscando...")
 
-        # Vectorize query
-        query_vector = self.vectorizer.vectorize(query)
+        if hasattr(self.vectorizer, 'vectorize_query'):
+            query_vector = self.vectorizer.vectorize_query(query)
+        else:
+            query_vector = self.vectorizer.vectorize(query)
 
         # Hybrid search with increased limit for pagination
         limit = self.user_config.search.default_limit

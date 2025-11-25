@@ -407,23 +407,20 @@ def rebuild(
     config: Optional[Path] = typer.Option(None, "--config", "-c", help="Custom config file"),
     profile: Optional[str] = typer.Option(None, "--profile", "-p", help="Config profile"),
     confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+    vectors_only: bool = typer.Option(False, "--vectors-only", "-v", help="Only re-vectorize, skip classification"),
+    resume: bool = typer.Option(True, "--resume/--no-resume", help="Resume from checkpoint (skip already converted)"),
 ):
     """
-    Rebuild all vectors and classifications without reimporting.
+    Rebuild vectors and/or classifications without reimporting.
 
-    This will:
-    1. Clear all vectors
-    2. Re-classify all messages (intent, topics)
-    3. Re-vectorize all messages
-
-    Useful when:
-    - You changed classifier/vectorizer models
-    - You fixed classifier logic (like topic extraction)
-    - Database is corrupted
+    Features:
+        --resume (default): Detects already-converted vectors by dimension and skips them
+        --no-resume: Force re-vectorize all messages
 
     Examples:
-        drecall rebuild
-        drecall rebuild --profile lite --yes
+        drecall rebuild --vectors-only --yes
+        drecall rebuild --vectors-only --yes --no-resume
+        drecall rebuild --profile nomic-384 --yes
     """
     try:
         # Confirmation
@@ -458,20 +455,64 @@ def rebuild(
         cursor = conn.execute("SELECT COUNT(*) FROM messages")
         total_messages = cursor.fetchone()[0]
 
-        console.print(f"Total mensajes a reprocesar: {total_messages}\n")
+        console.print(f"Total mensajes: {total_messages}\n")
 
-        # Initialize classifier
-        classifier_config = cfg['components']['classifier']
         from src.core.registry import ComponentRegistry
         registry = ComponentRegistry()
 
-        classifier = registry.create_instance(
-            name='classifier',
-            class_path=classifier_config['class'],
-            config=classifier_config.get('config', {})
-        )
+        # Step 1: Re-classify (skip if --vectors-only)
+        if not vectors_only:
+            classifier_config = cfg['components']['classifier']
+            classifier = registry.create_instance(
+                name='classifier',
+                class_path=classifier_config['class'],
+                config=classifier_config.get('config', {})
+            )
 
-        # Initialize vectorizer
+            console.print("[bold]Step 1/2: Re-clasificando...[/bold]")
+            classifier.load()
+
+            cursor = conn.execute("SELECT id, vectorizable_content FROM messages")
+            batch_size = classifier_config.get('config', {}).get('batch_size', 32)
+            rows = cursor.fetchall()
+
+            from rich.progress import Progress
+            with Progress() as progress:
+                task = progress.add_task("Clasificando...", total=len(rows))
+                updates = []
+
+                for i in range(0, len(rows), batch_size):
+                    batch = rows[i:i+batch_size]
+                    texts = [row[1] for row in batch]
+                    classifications = classifier.classify_batch(texts)
+
+                    for (msg_id, _), classification in zip(batch, classifications):
+                        import json
+                        updates.append((
+                            classification.intent,
+                            classification.confidence,
+                            json.dumps(classification.topics),
+                            int(classification.is_question),
+                            int(classification.is_command),
+                            msg_id
+                        ))
+                    progress.update(task, advance=len(batch))
+
+            classifier.unload()
+
+            conn.executemany("""
+                UPDATE messages
+                SET intent = ?, intent_confidence = ?, topics = ?, is_question = ?, is_command = ?
+                WHERE id = ?
+            """, updates)
+            conn.commit()
+            console.print(f"[green]✓[/green] {len(updates)} mensajes reclasificados\n")
+            step_prefix = "Step 2/2"
+        else:
+            console.print("[dim]Saltando clasificación (--vectors-only)[/dim]\n")
+            step_prefix = "Step 1/1"
+
+        # Step 2: Re-vectorize
         vectorizer_config = cfg['components']['vectorizer']
         vectorizer = registry.create_instance(
             name='vectorizer',
@@ -479,88 +520,67 @@ def rebuild(
             config=vectorizer_config.get('config', {})
         )
 
-        # Step 1: Re-classify
-        console.print("[bold]Step 1/3: Re-clasificando...[/bold]")
-        classifier.load()
-
-        cursor = conn.execute("SELECT id, vectorizable_content FROM messages")
-        batch_size = classifier_config.get('config', {}).get('batch_size', 32)
-
-        updates = []
-        rows = cursor.fetchall()
-
-        from rich.progress import Progress
-        with Progress() as progress:
-            task = progress.add_task("Clasificando...", total=len(rows))
-
-            for i in range(0, len(rows), batch_size):
-                batch = rows[i:i+batch_size]
-                texts = [row[1] for row in batch]
-
-                classifications = classifier.classify_batch(texts)
-
-                for (msg_id, _), classification in zip(batch, classifications):
-                    import json
-                    updates.append((
-                        classification.intent,
-                        classification.confidence,
-                        json.dumps(classification.topics),  # JSON, not str()
-                        int(classification.is_question),
-                        int(classification.is_command),
-                        msg_id
-                    ))
-
-                progress.update(task, advance=len(batch))
-
-        classifier.unload()
-
-        # Update DB
-        conn.executemany("""
-            UPDATE messages
-            SET intent = ?, intent_confidence = ?, topics = ?,
-                is_question = ?, is_command = ?
-            WHERE id = ?
-        """, updates)
-        conn.commit()
-
-        console.print(f"[green]✓[/green] {len(updates)} mensajes reclasificados\n")
-
-        # Step 2: Re-vectorize
-        console.print("[bold]Step 2/3: Re-vectorizando...[/bold]")
+        console.print(f"[bold]{step_prefix}: Re-vectorizando...[/bold]")
         vectorizer.load()
 
-        cursor = conn.execute("SELECT id, vectorizable_content FROM messages")
+        target_dim = vectorizer.get_embedding_dim()
         batch_size = vectorizer_config.get('config', {}).get('batch_size', 64)
-
-        vector_updates = []
-        rows = cursor.fetchall()
-
         import pickle
 
-        with Progress() as progress:
-            task = progress.add_task("Vectorizando...", total=len(rows))
+        # Get messages to process (with checkpoint support)
+        if resume:
+            console.print(f"[dim]Checkpoint: buscando mensajes sin vector de {target_dim} dims...[/dim]")
+            cursor = conn.execute("SELECT id, vectorizable_content, vector FROM messages")
+            all_rows = cursor.fetchall()
 
-            for i in range(0, len(rows), batch_size):
-                batch = rows[i:i+batch_size]
-                texts = [row[1] for row in batch]
+            rows = []
+            already_done = 0
+            for row in all_rows:
+                msg_id, content, vector_blob = row
+                if vector_blob:
+                    try:
+                        existing_vector = pickle.loads(vector_blob)
+                        if len(existing_vector) == target_dim:
+                            already_done += 1
+                            continue
+                    except:
+                        pass
+                rows.append((msg_id, content))
 
-                vectors = vectorizer.vectorize_batch(texts)
+            if already_done > 0:
+                console.print(f"[green]✓[/green] {already_done} mensajes ya tienen vectores de {target_dim}d (saltados)")
 
-                for (msg_id, _), vector in zip(batch, vectors):
-                    vector_blob = pickle.dumps(vector)
-                    vector_updates.append((vector_blob, msg_id))
+            if not rows:
+                console.print("[green]✓[/green] Todos los mensajes ya tienen vectores correctos")
+                vectorizer.unload()
+                conn.close()
+                return
+        else:
+            cursor = conn.execute("SELECT id, vectorizable_content FROM messages")
+            rows = cursor.fetchall()
 
-                progress.update(task, advance=len(batch))
+        total = len(rows)
+        console.print(f"Mensajes a vectorizar: {total}")
+
+        processed = 0
+        for i in range(0, total, batch_size):
+            batch = rows[i:i+batch_size]
+            texts = [row[1] for row in batch]
+            vectors = vectorizer.vectorize_batch(texts)
+
+            updates = []
+            for (msg_id, _), vector in zip(batch, vectors):
+                updates.append((pickle.dumps(vector), msg_id))
+
+            conn.executemany("UPDATE messages SET vector = ? WHERE id = ?", updates)
+            conn.commit()
+
+            processed += len(batch)
+            console.print(f"  Vectorizado: {processed}/{total} ({100*processed/total:.0f}%)")
 
         vectorizer.unload()
 
-        # Update DB
-        conn.executemany("""
-            UPDATE messages SET vector = ? WHERE id = ?
-        """, vector_updates)
-        conn.commit()
-
-        console.print(f"[green]✓[/green] {len(vector_updates)} vectores regenerados\n")
+        console.print(f"[green]✓[/green] {total} vectores regenerados\n")
 
         # Step 3: Stats
         console.print("[bold]Step 3/3: Verificando...[/bold]")

@@ -45,25 +45,26 @@ class MacroNode:
     - Topic is NOT a continuation of recent context
     """
 
+    # Campos requeridos (sin default) primero
     id: str
-    type: str = "MACRO"  # Always 'MACRO'
     main_topic: str
-    summary: str  # Generated summary of the thread
+    summary: str
     timestamp_start: datetime
+
+    # Campos con default
+    type: str = "MACRO"
     timestamp_end: Optional[datetime] = None
-    status: str = "active"  # active, archived
-
-    # Child nodes (messages within this context)
+    status: str = "active"
+    vector: Optional[np.ndarray] = None
     children: List[MicroNode] = field(default_factory=list)
-
-    # Metadata
     total_messages: int = 0
-    topics: List[str] = field(default_factory=list)  # All discussed topics
-    entities: List[str] = field(default_factory=list)  # Extracted entities
+    topics: List[str] = field(default_factory=list)
+    entities: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> dict:
+    def to_dict(self, include_vector: bool = False) -> dict:
         """Serialize to dict."""
-        return {
+        result = {
             'id': self.id,
             'type': self.type,
             'main_topic': self.main_topic,
@@ -86,7 +87,11 @@ class MacroNode:
             'total_messages': self.total_messages,
             'topics': self.topics,
             'entities': self.entities,
+            'metadata': self.metadata,
         }
+        if include_vector and self.vector is not None:
+            result['vector'] = self.vector.tolist()
+        return result
 
 
 @dataclass

@@ -38,8 +38,8 @@ class EmbeddingGemmaVectorizer(IVectorizer):
             )
 
         self.config = config or {}
-        self.model_name = self.config.get("model", "google/gemma-2-2b-it")
-        self.target_dim = self.config.get("embedding_dim", 256)  # Matryoshka truncation
+        self.model_name = self.config.get("model", "google/embeddinggemma-300m")
+        self.target_dim = self.config.get("dimension", 512)
         self.batch_size = self.config.get("batch_size", 64)
         self.device = self.config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         self.quantization = self.config.get("quantization", "fp16")  # int8, fp16, fp32

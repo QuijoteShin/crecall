@@ -4,14 +4,24 @@
 import sqlite3
 import json
 import pickle
+import re
 from pathlib import Path
+from datetime import datetime
 from typing import List, Optional, Dict, Any
 import numpy as np
+
+try:
+    import sqlite_vec
+    SQLITE_VEC_AVAILABLE = True
+except ImportError:
+    SQLITE_VEC_AVAILABLE = False
+    sqlite_vec = None
 
 from ..contracts.storage import IStorage
 from ..models.processed import ProcessedMessage, Classification
 from ..models.normalized import NormalizedMessage
 from ..models.search import SearchResult
+from ..models.hcs import MacroNode, MicroNode
 
 
 class SQLiteVectorStorage(IStorage):
@@ -28,6 +38,7 @@ class SQLiteVectorStorage(IStorage):
         self.config = config or {}
         self.database_path = Path(self.config.get("database", "data/recall.db"))
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.vec_dim = self.config.get("dimension", 256)
 
         self.conn: Optional[sqlite3.Connection] = None
         self._sqlite_vec_available = False
@@ -38,15 +49,20 @@ class SQLiteVectorStorage(IStorage):
             self.conn = sqlite3.connect(str(self.database_path))
             self.conn.row_factory = sqlite3.Row
 
-            # Try to load sqlite-vec extension
-            try:
-                self.conn.enable_load_extension(True)
-                self.conn.load_extension("vec0")
-                self._sqlite_vec_available = True
-                print("✓ sqlite-vec extension loaded")
-            except:
+            # Cargar sqlite-vec si disponible
+            if SQLITE_VEC_AVAILABLE and sqlite_vec is not None:
+                try:
+                    self.conn.enable_load_extension(True)
+                    sqlite_vec.load(self.conn)
+                    self.conn.enable_load_extension(False)
+                    self._sqlite_vec_available = True
+                    print("✓ sqlite-vec cargado")
+                except Exception as e:
+                    self._sqlite_vec_available = False
+                    print(f"⚠ sqlite-vec no disponible: {e}")
+            else:
                 self._sqlite_vec_available = False
-                print("⚠ sqlite-vec not available, using fallback vector search")
+                print("⚠ sqlite-vec no instalado, usando búsqueda vectorial fallback")
 
         return self.conn
 
@@ -148,6 +164,65 @@ class SQLiteVectorStorage(IStorage):
                 VALUES (new.rowid, new.id, new.content, new.clean_content, new.vectorizable_content);
             END
         """)
+
+        # HCS: Tabla de MacroNodes (tópicos)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS hcs_macro_nodes (
+                id TEXT PRIMARY KEY,
+                main_topic TEXT NOT NULL,
+                summary TEXT,
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP NOT NULL,
+                last_active TIMESTAMP,
+                total_messages INTEGER DEFAULT 0,
+                topics TEXT,
+                entities TEXT,
+                metadata TEXT,
+                vector BLOB
+            )
+        """)
+
+        # HCS: Tabla de MicroNodes (mensajes dentro de un macro)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS hcs_micro_nodes (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                parent_macro_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content_preview TEXT,
+                timestamp TIMESTAMP NOT NULL,
+                is_question INTEGER DEFAULT 0,
+                FOREIGN KEY (parent_macro_id) REFERENCES hcs_macro_nodes(id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_micro_parent
+            ON hcs_micro_nodes(parent_macro_id)
+        """)
+
+        # HCS: FTS para búsqueda de tópicos
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS hcs_macro_fts USING fts5(
+                main_topic,
+                summary,
+                content='hcs_macro_nodes',
+                content_rowid='rowid'
+            )
+        """)
+
+        # HCS: Tabla vectorial con sqlite-vec (si disponible)
+        if self._sqlite_vec_available:
+            try:
+                conn.execute(f"""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS vec_hcs_macro USING vec0(
+                        macro_rowid INTEGER PRIMARY KEY,
+                        vector float[{self.vec_dim}]
+                    )
+                """)
+                print(f"✓ Tabla vectorial HCS creada (dim={self.vec_dim})")
+            except Exception as e:
+                print(f"⚠ No se pudo crear tabla vectorial: {e}")
 
         conn.commit()
         print("✓ Database initialized")
@@ -335,27 +410,26 @@ class SQLiteVectorStorage(IStorage):
         """
         Extract meaningful keywords from query.
 
-        Removes stopwords but keeps proper nouns and important terms.
+        Preserva acrónimos (SQL, API, AWS) y filtra stopwords.
         """
         if not query_text:
             return []
 
-        import re
+        # Extraer palabras preservando case original
+        words = re.findall(r'\b\w+\b', query_text)
 
-        # Split into words
-        words = re.findall(r'\b\w+\b', query_text.lower())
-
-        # Ultra-minimal stopwords (keep proper nouns)
+        # Stopwords bilingüe
         stopwords = {
             'es', 'de', 'la', 'el', 'en', 'y', 'a', 'que', 'los', 'las',
             'un', 'una', 'por', 'para', 'con', 'del', 'al',
-            'is', 'the', 'of', 'and', 'to', 'in', 'for', 'with'
+            'is', 'the', 'of', 'and', 'to', 'in', 'for', 'with',
+            'this', 'that', 'from', 'are', 'was', 'were', 'be', 'been'
         }
 
-        # Keep words longer than 3 chars or proper nouns (capitalized in original)
+        # Lógica corregida: preserva acrónimos (mayúsculas) y palabras > 2 chars
         keywords = [
-            w for w in words
-            if len(w) > 3 or w not in stopwords
+            w.lower() for w in words
+            if w.lower() not in stopwords and (len(w) > 2 or w.isupper())
         ]
 
         # Remove duplicates while preserving order
@@ -709,3 +783,251 @@ class SQLiteVectorStorage(IStorage):
         """, params)
 
         return [self._row_to_processed_message(row) for row in cursor]
+
+    # ==================== HCS Methods ====================
+
+    def save_macro_node(self, node: MacroNode) -> str:
+        """Persistir MacroNode con su vector."""
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        vector_blob = pickle.dumps(node.vector) if node.vector is not None else None
+
+        cursor.execute("""
+            INSERT OR REPLACE INTO hcs_macro_nodes
+            (id, main_topic, summary, status, created_at, last_active,
+             total_messages, topics, entities, metadata, vector)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            node.id,
+            node.main_topic,
+            node.summary,
+            node.status,
+            node.timestamp_start.isoformat(),
+            node.timestamp_end.isoformat() if node.timestamp_end else None,
+            node.total_messages,
+            json.dumps(node.topics),
+            json.dumps(node.entities),
+            json.dumps(node.metadata),
+            vector_blob
+        ))
+
+        # Obtener rowid para tabla vectorial
+        cursor.execute("SELECT rowid FROM hcs_macro_nodes WHERE id = ?", (node.id,))
+        row = cursor.fetchone()
+        rowid = row[0] if row else None
+
+        # Insertar en tabla vectorial sqlite-vec si disponible
+        if self._sqlite_vec_available and node.vector is not None and rowid:
+            try:
+                vec_bytes = node.vector.astype(np.float32).tobytes()
+                cursor.execute("""
+                    INSERT OR REPLACE INTO vec_hcs_macro (macro_rowid, vector)
+                    VALUES (?, ?)
+                """, (rowid, vec_bytes))
+            except Exception as e:
+                print(f"⚠ Error insertando vector en sqlite-vec: {e}")
+
+        conn.commit()
+        return node.id
+
+    def save_micro_node(self, node: MicroNode) -> str:
+        """Persistir MicroNode."""
+        conn = self._connect()
+
+        conn.execute("""
+            INSERT OR REPLACE INTO hcs_micro_nodes
+            (id, message_id, parent_macro_id, role, content_preview, timestamp, is_question)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            node.id,
+            node.message_id,
+            node.parent_macro_id,
+            node.role,
+            node.content_preview,
+            node.timestamp.isoformat(),
+            int(node.is_question)
+        ))
+
+        conn.commit()
+        return node.id
+
+    def get_macro_node_by_id(self, macro_id: str) -> Optional[MacroNode]:
+        """Obtener MacroNode por ID."""
+        conn = self._connect()
+
+        cursor = conn.execute("""
+            SELECT * FROM hcs_macro_nodes WHERE id = ?
+        """, (macro_id,))
+
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        return self._row_to_macro_node(row)
+
+    def get_recent_macro_nodes(self, limit: int = 5, status: str = 'active') -> List[MacroNode]:
+        """Obtener MacroNodes recientes."""
+        conn = self._connect()
+
+        cursor = conn.execute("""
+            SELECT * FROM hcs_macro_nodes
+            WHERE status = ?
+            ORDER BY last_active DESC NULLS LAST, created_at DESC
+            LIMIT ?
+        """, (status, limit))
+
+        return [self._row_to_macro_node(row) for row in cursor]
+
+    def get_micro_nodes_for_macro(self, macro_id: str) -> List[MicroNode]:
+        """Obtener MicroNodes de un MacroNode."""
+        conn = self._connect()
+
+        cursor = conn.execute("""
+            SELECT * FROM hcs_micro_nodes
+            WHERE parent_macro_id = ?
+            ORDER BY timestamp ASC
+        """, (macro_id,))
+
+        return [self._row_to_micro_node(row) for row in cursor]
+
+    def search_macro_nodes_hybrid(
+        self,
+        query_vector: np.ndarray,
+        query_text: str,
+        limit: int = 10,
+        similarity_threshold: float = 0.4
+    ) -> List[Dict[str, Any]]:
+        """
+        Búsqueda híbrida de MacroNodes: vectorial + keywords.
+
+        Returns:
+            Lista de dicts con 'node', 'score', 'matched_on'
+        """
+        conn = self._connect()
+        results = []
+        keywords = self._extract_keywords(query_text)
+
+        if self._sqlite_vec_available:
+            try:
+                vec_bytes = query_vector.astype(np.float32).tobytes()
+                cursor = conn.execute("""
+                    SELECT
+                        m.*,
+                        vec_distance_cosine(v.vector, ?) as distance
+                    FROM vec_hcs_macro v
+                    JOIN hcs_macro_nodes m ON m.rowid = v.macro_rowid
+                    WHERE m.status = 'active'
+                    ORDER BY distance ASC
+                    LIMIT ?
+                """, (vec_bytes, limit * 2))
+
+                for row in cursor:
+                    similarity = 1 - row['distance']
+                    if similarity >= similarity_threshold:
+                        node = self._row_to_macro_node(row)
+                        keyword_boost = self._calc_keyword_boost(node, keywords)
+                        results.append({
+                            'node': node,
+                            'score': similarity + keyword_boost,
+                            'vector_score': similarity,
+                            'keyword_boost': keyword_boost,
+                            'matched_on': 'sqlite-vec'
+                        })
+            except Exception as e:
+                print(f"⚠ sqlite-vec search failed, using fallback: {e}")
+                results = self._search_macro_fallback(query_vector, keywords, limit, similarity_threshold)
+        else:
+            results = self._search_macro_fallback(query_vector, keywords, limit, similarity_threshold)
+
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results[:limit]
+
+    def _search_macro_fallback(
+        self,
+        query_vector: np.ndarray,
+        keywords: List[str],
+        limit: int,
+        threshold: float
+    ) -> List[Dict[str, Any]]:
+        """Búsqueda vectorial fallback en Python."""
+        conn = self._connect()
+        results = []
+
+        cursor = conn.execute("""
+            SELECT * FROM hcs_macro_nodes
+            WHERE status = 'active' AND vector IS NOT NULL
+        """)
+
+        for row in cursor:
+            stored_vector = pickle.loads(row['vector'])
+            similarity = float(np.dot(query_vector, stored_vector))
+
+            if similarity >= threshold:
+                node = self._row_to_macro_node(row)
+                keyword_boost = self._calc_keyword_boost(node, keywords)
+                results.append({
+                    'node': node,
+                    'score': similarity + keyword_boost,
+                    'vector_score': similarity,
+                    'keyword_boost': keyword_boost,
+                    'matched_on': 'fallback'
+                })
+
+        return results
+
+    def _calc_keyword_boost(self, node: MacroNode, keywords: List[str]) -> float:
+        """Calcular boost por coincidencia de keywords."""
+        if not keywords:
+            return 0.0
+
+        content = f"{node.main_topic} {node.summary or ''} {' '.join(node.topics)}".lower()
+        matches = sum(1 for kw in keywords if kw in content)
+
+        if matches > 0:
+            return 0.15 + (0.05 * min(matches, 5))
+        return 0.0
+
+    def _row_to_macro_node(self, row: sqlite3.Row) -> MacroNode:
+        """Convertir row de BD a MacroNode."""
+        vector = None
+        if row['vector']:
+            vector = pickle.loads(row['vector'])
+
+        created_at = row['created_at']
+        if isinstance(created_at, str):
+            created_at = datetime.fromisoformat(created_at)
+
+        last_active = row['last_active']
+        if last_active and isinstance(last_active, str):
+            last_active = datetime.fromisoformat(last_active)
+
+        return MacroNode(
+            id=row['id'],
+            main_topic=row['main_topic'],
+            summary=row['summary'] or "",
+            status=row['status'],
+            timestamp_start=created_at,
+            timestamp_end=last_active,
+            total_messages=row['total_messages'] or 0,
+            topics=json.loads(row['topics']) if row['topics'] else [],
+            entities=json.loads(row['entities']) if row['entities'] else [],
+            metadata=json.loads(row['metadata']) if row['metadata'] else {},
+            vector=vector
+        )
+
+    def _row_to_micro_node(self, row: sqlite3.Row) -> MicroNode:
+        """Convertir row de BD a MicroNode."""
+        timestamp = row['timestamp']
+        if isinstance(timestamp, str):
+            timestamp = datetime.fromisoformat(timestamp)
+
+        return MicroNode(
+            id=row['id'],
+            message_id=row['message_id'],
+            parent_macro_id=row['parent_macro_id'],
+            role=row['role'],
+            content_preview=row['content_preview'] or "",
+            timestamp=timestamp,
+            is_question=bool(row['is_question'])
+        )
