@@ -97,6 +97,7 @@ def search(
     limit: int = typer.Option(10, "--limit", "-n", help="Number of results"),
     mode: str = typer.Option("vector", "--mode", "-m", help="Search mode: vector, text, or hybrid"),
     config: Optional[Path] = typer.Option(None, "--config", "-c", help="Custom config file"),
+    topic: Optional[str] = typer.Option(None, "--topic", "-t", help="Filter by segment topic"),
 ):
     """
     Search indexed messages.
@@ -105,6 +106,7 @@ def search(
         drecall search "how to implement authentication"
         drecall search "python async" --limit 20
         drecall search "error handling" --mode text
+        drecall search "architecture" --topic "Salud Visual"
     """
     try:
         # Load configuration
@@ -114,9 +116,14 @@ def search(
         storage_config = cfg['components']['storage']['config']
         storage = SQLiteVectorStorage(config=storage_config)
 
+        # Build filters
+        filters = {}
+        if topic:
+            filters['segment_topic'] = topic
+
         if mode == "text":
             # Text search
-            results = storage.search_by_text(query, limit=limit)
+            results = storage.search_by_text(query, limit=limit, filters=filters)
 
         elif mode == "vector":
             # Vector search - need to vectorize query first
@@ -127,7 +134,7 @@ def search(
             vectorizer.load()
 
             query_vector = vectorizer.vectorize(query)
-            results = storage.search_by_vector(query_vector, limit=limit)
+            results = storage.search_by_vector(query_vector, limit=limit, filters=filters)
 
             vectorizer.unload()
 
@@ -148,6 +155,12 @@ def search(
 
             console.print(f"[cyan]{i}. Score: {score:.3f}[/cyan]")
             console.print(f"   Conversation: {msg.normalized.conversation_id}")
+
+            # Show segment topic if available
+            segment_topic = msg.normalized.metadata.get('segment_topic')
+            if segment_topic:
+                console.print(f"   Topic: [bold]{segment_topic}[/bold]")
+
             console.print(f"   Author: {msg.normalized.author_role}")
             console.print(f"   Intent: {msg.classification.intent} ({msg.classification.confidence:.2f})")
             console.print(f"   Timestamp: {msg.normalized.timestamp}")
@@ -317,8 +330,13 @@ def interactive():
     - Topic search: ..topic.. or query ..topic..
     - ESC returns without losing context
     """
-    from src.tui.app import run_interactive
-    run_interactive()
+    from src.tui.tui_app import run_tui
+    try:
+        run_tui()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        console.print(f"[red]Failed to start TUI:[/red] {e}")
 
 
 @app.command()
@@ -328,6 +346,8 @@ def rebuild(
     confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
     vectors_only: bool = typer.Option(False, "--vectors-only", "-v", help="Only re-vectorize, skip classification"),
     resume: bool = typer.Option(True, "--resume/--no-resume", help="Resume from checkpoint (skip already converted)"),
+    segment: bool = typer.Option(False, "--segment", "-s", help="Apply semantic segmentation (Topic Drift detection)"),
+    segment_threshold: float = typer.Option(0.5, "--segment-threshold", help="Similarity threshold for topic drift (0.0-1.0)"),
 ):
     """
     Rebuild vectors and/or classifications without reimporting.
@@ -335,10 +355,13 @@ def rebuild(
     Features:
         --resume (default): Detects already-converted vectors by dimension and skips them
         --no-resume: Force re-vectorize all messages
+        --segment: Apply semantic segmentation to detect topic changes within conversations
 
     Examples:
         crec rebuild --vectors-only --yes
         crec rebuild --vectors-only --yes --no-resume
+        crec rebuild --vectors-only --yes --segment
+        crec rebuild --segment --segment-threshold 0.6
     """
     import pickle
     import sqlite3
@@ -493,8 +516,145 @@ def rebuild(
         vectorizer.unload()
         console.print(f"[green]✓[/green] {total} vectors regenerated\n")
 
+        # Semantic Segmentation (Topic Drift Detection)
+        if segment:
+            from src.core.segmentation import SemanticSegmenter
+            from rich.progress import Progress
+
+            console.print(f"\n[bold]Semantic Segmentation (HCS)[/bold]")
+            console.print(f"Similarity threshold: {segment_threshold}")
+
+            # Ensure segmentation columns exist (migration)
+            storage.migrate_add_segmentation_columns()
+
+            # Get conversations that need segmentation
+            conversation_ids = storage.get_conversations_for_segmentation()
+
+            if not conversation_ids:
+                console.print("[yellow]No conversations need segmentation[/yellow]")
+            else:
+                console.print(f"Found {len(conversation_ids)} conversations to segment\n")
+
+                segmenter = SemanticSegmenter(similarity_threshold=segment_threshold)
+                total_segments = 0
+
+                with Progress() as progress:
+                    task = progress.add_task("Segmenting conversations...", total=len(conversation_ids))
+
+                    for conv_id in conversation_ids:
+                        # Get all messages for this conversation
+                        conv_messages = storage.get_conversation_messages(conv_id)
+
+                        # Segment the conversation
+                        segments = segmenter.segment_conversation(conv_id, conv_messages)
+
+                        # Update database
+                        updates = segmenter.get_segment_updates(segments)
+                        if updates:
+                            storage.update_segments_batch(updates)
+                            total_segments += len(segments)
+
+                        progress.update(task, advance=1)
+
+                console.print(f"[green]✓[/green] Created {total_segments} topic segments from {len(conversation_ids)} conversations\n")
+
+                # Show segment distribution
+                cursor = conn.execute("""
+                    SELECT segment_topic, COUNT(*) as msg_count
+                    FROM messages
+                    WHERE segment_topic IS NOT NULL
+                    GROUP BY segment_topic
+                    ORDER BY msg_count DESC
+                    LIMIT 10
+                """)
+
+                console.print("[bold]Top 10 Topics:[/bold]")
+                for row in cursor:
+                    console.print(f"  • {row[0]}: {row[1]} messages")
+                console.print()
+
         console.print("[bold green]✓ Rebuild complete[/bold green]")
         conn.close()
+
+    except Exception as e:
+        console.print(f"\n[bold red]✗ Error:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def topics(
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Custom config file"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Number of topics to show"),
+):
+    """
+    List all available topic segments.
+
+    Examples:
+        crec topics
+        crec topics --limit 50
+    """
+    try:
+        # Load configuration
+        cfg = ConfigLoader.load(config)
+
+        # Initialize storage
+        storage_config = cfg['components']['storage']['config']
+        storage = SQLiteVectorStorage(config=storage_config)
+
+        conn = storage._connect()
+
+        # Get topic distribution
+        cursor = conn.execute(f"""
+            SELECT
+                segment_topic,
+                COUNT(*) as message_count,
+                COUNT(DISTINCT conversation_id) as conversation_count,
+                MIN(timestamp) as first_seen,
+                MAX(timestamp) as last_seen
+            FROM messages
+            WHERE segment_topic IS NOT NULL
+            GROUP BY segment_topic
+            ORDER BY message_count DESC
+            LIMIT ?
+        """, (limit,))
+
+        topics_data = cursor.fetchall()
+
+        if not topics_data:
+            console.print("[yellow]No topics found. Run 'crec rebuild --segment' first.[/yellow]")
+            return
+
+        # Create table
+        table = Table(title=f"Topic Segments (Top {len(topics_data)})")
+        table.add_column("Topic", style="cyan")
+        table.add_column("Messages", style="green", justify="right")
+        table.add_column("Conversations", style="yellow", justify="right")
+        table.add_column("Date Range", style="dim")
+
+        for row in topics_data:
+            topic = row[0]
+            msg_count = row[1]
+            conv_count = row[2]
+            first = row[3][:10] if row[3] else "N/A"
+            last = row[4][:10] if row[4] else "N/A"
+
+            date_range = f"{first} to {last}" if first != last else first
+
+            table.add_row(topic, str(msg_count), str(conv_count), date_range)
+
+        console.print(table)
+
+        # Show total stats
+        cursor = conn.execute("""
+            SELECT
+                COUNT(DISTINCT segment_topic) as total_topics,
+                COUNT(*) as total_segmented_messages
+            FROM messages
+            WHERE segment_topic IS NOT NULL
+        """)
+        stats = cursor.fetchone()
+
+        console.print(f"\n[dim]Total topics: {stats[0]} | Segmented messages: {stats[1]}[/dim]")
 
     except Exception as e:
         console.print(f"\n[bold red]✗ Error:[/bold red] {e}")

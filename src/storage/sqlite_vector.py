@@ -41,12 +41,13 @@ class SQLiteVectorStorage(IStorage):
             # Try to load sqlite-vec extension
             try:
                 self.conn.enable_load_extension(True)
-                self.conn.load_extension("vec0")
+                import sqlite_vec
+                self.conn.load_extension(sqlite_vec.loadable_path())
                 self._sqlite_vec_available = True
-                print("✓ sqlite-vec extension loaded")
-            except:
+                # print("✓ sqlite-vec extension loaded")
+            except Exception as e:
                 self._sqlite_vec_available = False
-                print("⚠ sqlite-vec not available, using fallback vector search")
+                print(f"⚠ sqlite-vec not available, using fallback vector search: {e}")
 
         return self.conn
 
@@ -73,6 +74,11 @@ class SQLiteVectorStorage(IStorage):
                 topics TEXT NOT NULL,  -- JSON array
                 is_question INTEGER NOT NULL,
                 is_command INTEGER NOT NULL,
+
+                -- Semantic Segmentation (HCS Layer)
+                segment_id TEXT,  -- Segment identifier (e.g., "conv123_seg1")
+                segment_topic TEXT,  -- Auto-generated topic label (e.g., "Salud Visual")
+                segment_sequence INTEGER,  -- Sequence number within conversation (1, 2, 3...)
 
                 -- Metadata
                 metadata TEXT NOT NULL,  -- JSON object
@@ -127,6 +133,11 @@ class SQLiteVectorStorage(IStorage):
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_intent
             ON messages(intent)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_segment_topic
+            ON messages(segment_topic)
         """)
 
         # Full-text search table
@@ -264,6 +275,9 @@ class SQLiteVectorStorage(IStorage):
             if 'intent' in filters:
                 where_clauses.append("intent = :intent")
                 params['intent'] = filters['intent']
+            if 'segment_topic' in filters:
+                where_clauses.append("segment_topic = :segment_topic")
+                params['segment_topic'] = filters['segment_topic']
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}"
 
@@ -320,6 +334,9 @@ class SQLiteVectorStorage(IStorage):
             if 'intent' in filters:
                 where_clauses.append("intent = :intent")
                 params['intent'] = filters['intent']
+            if 'segment_topic' in filters:
+                where_clauses.append("segment_topic = :segment_topic")
+                params['segment_topic'] = filters['segment_topic']
 
         where_sql = ' AND '.join(where_clauses)
 
@@ -412,7 +429,15 @@ class SQLiteVectorStorage(IStorage):
         if row['vector']:
             vector = pickle.loads(row['vector'])
 
-        # Reconstruct normalized message
+        # Reconstruct normalized message with segment info
+        metadata = json.loads(row['metadata'])
+
+        # Add segment information if available
+        if 'segment_topic' in row.keys() and row['segment_topic']:
+            metadata['segment_topic'] = row['segment_topic']
+            metadata['segment_id'] = row.get('segment_id')
+            metadata['segment_sequence'] = row.get('segment_sequence')
+
         normalized = NormalizedMessage(
             id=row['id'],
             conversation_id=row['conversation_id'],
@@ -420,7 +445,7 @@ class SQLiteVectorStorage(IStorage):
             content=row['content'],
             content_type=row['content_type'],
             timestamp=datetime.fromisoformat(row['timestamp']),
-            metadata=json.loads(row['metadata']),
+            metadata=metadata,
             parent_message_id=row['parent_message_id'],
         )
 
@@ -561,3 +586,90 @@ class SQLiteVectorStorage(IStorage):
         """, params)
 
         return [self._row_to_processed_message(row) for row in cursor]
+
+    def migrate_add_segmentation_columns(self) -> None:
+        """Add segmentation columns to existing database (migration)."""
+        conn = self._connect()
+
+        try:
+            conn.execute("ALTER TABLE messages ADD COLUMN segment_id TEXT")
+            print("✓ Added column: segment_id")
+        except:
+            pass  # Column already exists
+
+        try:
+            conn.execute("ALTER TABLE messages ADD COLUMN segment_topic TEXT")
+            print("✓ Added column: segment_topic")
+        except:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE messages ADD COLUMN segment_sequence INTEGER")
+            print("✓ Added column: segment_sequence")
+        except:
+            pass
+
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_segment_topic ON messages(segment_topic)")
+            print("✓ Created index: idx_segment_topic")
+        except:
+            pass
+
+        conn.commit()
+
+    def get_conversations_for_segmentation(self) -> List[str]:
+        """Get list of conversation IDs that need segmentation."""
+        conn = self._connect()
+
+        cursor = conn.execute("""
+            SELECT DISTINCT conversation_id
+            FROM messages
+            WHERE segment_id IS NULL AND vector IS NOT NULL
+            ORDER BY conversation_id
+        """)
+
+        return [row[0] for row in cursor]
+
+    def update_message_segment(
+        self,
+        message_id: str,
+        segment_id: str,
+        segment_topic: str,
+        segment_sequence: int
+    ) -> None:
+        """Update segment information for a message."""
+        conn = self._connect()
+
+        conn.execute("""
+            UPDATE messages
+            SET segment_id = ?, segment_topic = ?, segment_sequence = ?
+            WHERE id = ?
+        """, (segment_id, segment_topic, segment_sequence, message_id))
+
+        conn.commit()
+
+    def update_segments_batch(self, segments: List[Dict[str, Any]]) -> int:
+        """
+        Batch update segment information.
+
+        Args:
+            segments: List of dicts with keys: message_id, segment_id, segment_topic, segment_sequence
+
+        Returns:
+            Number of messages updated
+        """
+        conn = self._connect()
+
+        updates = [
+            (s['segment_id'], s['segment_topic'], s['segment_sequence'], s['message_id'])
+            for s in segments
+        ]
+
+        conn.executemany("""
+            UPDATE messages
+            SET segment_id = ?, segment_topic = ?, segment_sequence = ?
+            WHERE id = ?
+        """, updates)
+
+        conn.commit()
+        return len(updates)
