@@ -390,6 +390,13 @@ def rebuild(
         console.print("Loading messages...")
         conn = sqlite3.connect(storage_config['database'])
 
+        # Check if table exists
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'")
+        if not cursor.fetchone():
+            console.print("[red]Error: Database is empty (no 'messages' table).[/red]")
+            console.print("You must import data first using: [bold]crec init <path_to_zip>[/bold]")
+            return
+
         cursor = conn.execute("SELECT COUNT(*) FROM messages")
         total_messages = cursor.fetchone()[0]
         console.print(f"Total messages: {total_messages}\n")

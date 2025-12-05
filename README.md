@@ -38,9 +38,15 @@ pip install -e .
 Ve a ChatGPT -> Settings -> Data Controls -> Export Data. Recibirás un `.zip`.
 
 ### 2. Indexa tu historial
+Copia el archivo `.zip` a la carpeta `process/in/` (créala si no existe) o pasa la ruta directa:
+
 ```bash
-# Reemplaza con la ruta a tu zip
-python crec.py init ruta/a/tu/export.zip --profile express
+# Opción A: Ruta directa
+python crec.py init ruta/a/tu/export.zip
+
+# Opción B: Carpeta estándar (recomendado)
+# mkdir -p process/in && cp ~/Downloads/export.zip process/in/
+python crec.py init process/in/export.zip
 ```
 *Tip: `--profile express` es ideal para empezar rápido.*
 
@@ -60,8 +66,12 @@ python crec.py interactive
 
 ## Preguntas Frecuentes
 
-**¿Necesito una GPU potente?**
-No. El modo `--profile express` usa modelos ligeros que corren bien en CPU. Si tienes GPU, úsala para indexar más rápido.
+**¿Qué perfil uso si tengo GPU (NVIDIA)?**
+¡El estándar! Ejecuta `init` sin argumentos extra. Usará tu GPU para clasificar intenciones (Pregunta/Comando/Social) y vectorizar.
+Usa `--profile express` solo si tienes mucha prisa (salta la clasificación de intenciones).
+
+**¿Y si NO tengo GPU?**
+Usa `--profile express --cpu-only`. Funcionará perfecto pero sin clasificación de intenciones.
 
 **¿Mis datos se envían a alguna nube?**
 No. Absolutamente todo (base de datos, vectores, modelos) vive en tu carpeta local.
