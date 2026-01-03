@@ -17,6 +17,7 @@ lxml>=4.9.0
 transformers>=4.35.0
 torch>=2.0.0
 sentence-transformers>=2.2.0
+llama-cpp-python>=0.3.0  # For SLM-based semantic refiner (GGUF models)
 
 # Storage (swappable via IStorage interface)
 sqlite-vec>=0.1.0

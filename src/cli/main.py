@@ -1,6 +1,10 @@
 # src/cli/main.py
 """Chat Recall (crec) - Deep Research Chat Recall CLI."""
 
+# Set CUDA memory config BEFORE importing torch (via sentence_transformers)
+import os
+os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
+
 from pathlib import Path
 from typing import Optional
 import sys
@@ -315,6 +319,538 @@ def reindex(
 
     except Exception as e:
         console.print(f"\n[bold red]✗ Error:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command(name="refine-reindex")
+def refine_reindex(
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Custom config file"),
+    profile: Optional[str] = typer.Option(None, "--profile", "-p", help="Config profile"),
+    limit: Optional[int] = typer.Option(None, "--limit", help="Max items to process (for testing)"),
+    batch_size: int = typer.Option(8, "--batch-size", help="Batch size for SLM processing"),
+    force: bool = typer.Option(False, "--force", "-f", help="Re-refine all (not just unrefined)"),
+    chunks_only: bool = typer.Option(False, "--chunks-only", help="Only process chunks (skip messages)"),
+    include_chunks: bool = typer.Option(True, "--chunks/--no-chunks", help="Also process message chunks"),
+    confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """
+    Re-process existing messages through Semantic Refiner + new Vectorizer.
+
+    This command reads from SQLite (not source files), runs the SLM to extract
+    semantic intent, and generates new embeddings. The app can continue serving
+    queries with old vectors while this runs in the background.
+
+    Use Cases:
+    - Initial refinement after upgrading to semantic pipeline
+    - Re-refine with improved SLM prompt
+    - Upgrade vectorizer model (e.g., MiniLM → GTE)
+
+    Examples:
+        crec refine-reindex --yes
+        crec refine-reindex --profile default --limit 100
+        crec refine-reindex --force --yes  # Re-refine everything
+    """
+    import pickle
+
+    try:
+        if not confirm:
+            total = typer.confirm(
+                "This will refine and re-vectorize messages. Continue?",
+                default=False
+            )
+            if not total:
+                console.print("[yellow]Cancelled[/yellow]")
+                return
+
+        console.print("\n[bold cyan]Semantic Re-indexing[/bold cyan]\n")
+
+        # Load configuration
+        if profile:
+            profile_path = Path(f"config/{profile}.yaml")
+            if not profile_path.exists():
+                console.print(f"[red]Error:[/red] Profile '{profile}' not found")
+                raise typer.Exit(1)
+            cfg = ConfigLoader.load(profile_path)
+            console.print(f"[dim]Using profile: {profile}[/dim]")
+        else:
+            cfg = ConfigLoader.load(config)
+
+        # Check refiner is configured
+        if 'refiner' not in cfg.get('components', {}):
+            console.print("[red]Error:[/red] No refiner configured in selected profile")
+            console.print("Add 'refiner' component to your config or use --profile default")
+            raise typer.Exit(1)
+
+        # Initialize storage
+        storage_config = cfg['components']['storage']['config']
+        storage = SQLiteVectorStorage(config=storage_config)
+
+        # Run migration if needed
+        console.print("Checking database schema...")
+        storage.migrate_add_refined_content_column()
+
+        # Get messages to process (skip if chunks_only)
+        messages = []
+        if not chunks_only:
+            console.print("\nFetching messages...")
+            messages = storage.get_messages_for_refinement(
+                limit=limit,
+                only_unrefined=not force
+            )
+            console.print(f"Found {len(messages)} messages to process")
+        else:
+            console.print("[dim]Skipping messages (--chunks-only)[/dim]")
+
+        # Check if there's work to do
+        conn_check = storage._connect()
+        chunks_pending = conn_check.execute(
+            "SELECT COUNT(*) FROM message_chunks WHERE refined_text IS NULL"
+        ).fetchone()[0] if include_chunks or chunks_only else 0
+
+        if not messages and chunks_pending == 0:
+            console.print("[yellow]Nothing to refine.[/yellow]")
+            return
+
+        console.print(f"Chunks pending: {chunks_pending}\n")
+
+        # Initialize refiner
+        registry = ComponentRegistry()
+        refiner_config = cfg['components']['refiner']
+        refiner = registry.create_instance(
+            name='refiner',
+            class_path=refiner_config['class'],
+            config=refiner_config.get('config', {})
+        )
+
+        # Load both models upfront to avoid thrashing
+        console.print("[bold]Step 1/2: Semantic Refinement + Vectorization[/bold]")
+        refiner.load()
+
+        vectorizer_config = cfg['components']['vectorizer']
+        vectorizer = registry.create_instance(
+            name='vectorizer',
+            class_path=vectorizer_config['class'],
+            config=vectorizer_config.get('config', {})
+        )
+        vectorizer.load()
+
+        from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+
+        # Process in batches: refine → vectorize → save
+        chunk_size = 100  # Write to DB every 100 items
+        total_updated = 0
+
+        # Phase 1: Process messages (if any)
+        if messages:
+            console.print("[bold]Step 1/2: Processing Messages[/bold]")
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console
+            ) as progress:
+                task = progress.add_task("Refining messages...", total=len(messages))
+
+                chunk_data = []
+                MAX_SLM_INPUT = 6000  # SLM context limit
+
+                for i in range(0, len(messages), batch_size):
+                    batch = messages[i:i + batch_size]
+
+                    # Truncate long texts to avoid SLM hanging
+                    texts = []
+                    for msg in batch:
+                        text = msg.vectorizable_content or ''
+                        if len(text) > MAX_SLM_INPUT:
+                            text = text[:MAX_SLM_INPUT] + '...'
+                        texts.append(text)
+
+                    # Refine batch
+                    refinements = refiner.refine_batch(texts)
+
+                    # Vectorize refined content immediately
+                    refined_texts = [r.refined_content for r in refinements]
+                    vectors = vectorizer.vectorize_batch(refined_texts)
+
+                    # Accumulate for batch write
+                    for msg, refinement, vector in zip(batch, refinements, vectors):
+                        chunk_data.append({
+                            'message_id': msg.normalized.id,
+                            'refined_content': refinement.refined_content,
+                            'vector': vector
+                        })
+
+                    progress.update(task, advance=len(batch))
+
+                    # Write batch to DB
+                    if len(chunk_data) >= chunk_size:
+                        updated = storage.update_refined_content_batch(chunk_data)
+                        total_updated += updated
+                        chunk_data = []
+
+                # Write remaining data
+                if chunk_data:
+                    updated = storage.update_refined_content_batch(chunk_data)
+                    total_updated += updated
+
+        # Phase 2: Process chunks if enabled
+        if include_chunks or chunks_only:
+            console.print("\n[bold]Step 2/2: Processing Chunks[/bold]")
+
+            # Get chunks needing refinement
+            conn = storage._connect()
+            if force:
+                cursor = conn.execute("SELECT chunk_id, chunk_text FROM message_chunks")
+            else:
+                cursor = conn.execute("SELECT chunk_id, chunk_text FROM message_chunks WHERE refined_text IS NULL")
+
+            chunks_to_process = cursor.fetchall()
+            console.print(f"Found {len(chunks_to_process)} chunks to refine")
+
+            if chunks_to_process:
+                import pickle
+                chunk_updates = []
+
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    console=console
+                ) as progress:
+                    task = progress.add_task("Refining chunks...", total=len(chunks_to_process))
+
+                    for i in range(0, len(chunks_to_process), batch_size):
+                        batch = chunks_to_process[i:i + batch_size]
+                        chunk_ids = [c[0] for c in batch]
+                        chunk_texts = [c[1] or '' for c in batch]
+
+                        # Refine
+                        refinements = refiner.refine_batch(chunk_texts)
+
+                        # Vectorize refined content
+                        refined_texts = [r.refined_content for r in refinements]
+                        vectors = vectorizer.vectorize_batch(refined_texts)
+
+                        # Prepare updates
+                        for chunk_id, refinement, vector in zip(chunk_ids, refinements, vectors):
+                            chunk_updates.append((
+                                refinement.refined_content,
+                                chunk_id,
+                                pickle.dumps(vector)
+                            ))
+
+                        progress.update(task, advance=len(batch))
+
+                        # Write batch
+                        if len(chunk_updates) >= 100:
+                            conn.executemany("""
+                                UPDATE message_chunks SET refined_text = ? WHERE chunk_id = ?
+                            """, [(u[0], u[1]) for u in chunk_updates])
+
+                            for u in chunk_updates:
+                                conn.execute("""
+                                    INSERT OR REPLACE INTO vectors (entity_id, entity_type, vector, vector_dim, model_version)
+                                    VALUES (?, 'chunk', ?, 768, ?)
+                                """, (u[1], u[2], vectorizer_config['config'].get('model', 'unknown')))
+
+                            conn.commit()
+                            total_updated += len(chunk_updates)
+                            chunk_updates = []
+
+                    # Write remaining
+                    if chunk_updates:
+                        conn.executemany("""
+                            UPDATE message_chunks SET refined_text = ? WHERE chunk_id = ?
+                        """, [(u[0], u[1]) for u in chunk_updates])
+
+                        for u in chunk_updates:
+                            conn.execute("""
+                                INSERT OR REPLACE INTO vectors (entity_id, entity_type, vector, vector_dim, model_version)
+                                VALUES (?, 'chunk', ?, 768, ?)
+                            """, (u[1], u[2], vectorizer_config['config'].get('model', 'unknown')))
+
+                        conn.commit()
+                        total_updated += len(chunk_updates)
+
+        refiner.unload()
+        vectorizer.unload()
+
+        # Rebuild FTS index to sync with updated content
+        console.print("Rebuilding FTS index...")
+        storage.rebuild_fts_index()
+        console.print("[green]✓[/green] FTS index rebuilt")
+
+        console.print(f"\n[bold green]✓ Re-indexed {total_updated} messages[/bold green]")
+        console.print(f"  Refiner: {refiner_config['config'].get('model_path', 'default')}")
+        console.print(f"  Vectorizer: {vectorizer_config['config'].get('model', 'default')}")
+
+    except Exception as e:
+        console.print(f"\n[bold red]✗ Error:[/bold red] {e}")
+        import traceback
+        traceback.print_exc()
+        raise typer.Exit(1)
+
+
+@app.command()
+def migrate(
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Custom config file"),
+):
+    """
+    Run database migrations to add new columns.
+
+    This is safe to run multiple times - it will skip columns that already exist.
+
+    Examples:
+        crec migrate
+    """
+    try:
+        console.print("[bold cyan]Running database migrations...[/bold cyan]\n")
+
+        # Load configuration
+        cfg = ConfigLoader.load(config)
+
+        # Initialize storage
+        storage_config = cfg['components']['storage']['config']
+        storage = SQLiteVectorStorage(config=storage_config)
+
+        # Run migrations
+        console.print("Adding segmentation columns...")
+        storage.migrate_add_segmentation_columns()
+
+        console.print("\nAdding refined_content column...")
+        storage.migrate_add_refined_content_column()
+
+        console.print("\n[bold green]✓ Migrations complete[/bold green]")
+
+    except Exception as e:
+        console.print(f"\n[bold red]✗ Error:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def revectorize(
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Custom config file"),
+    batch_size: int = typer.Option(4, "--batch-size", "-b", help="Batch size for vectorization (4 safe for 8GB GPUs with GTE)"),
+    limit: Optional[int] = typer.Option(None, "--limit", help="Max items to process"),
+    include_chunks: bool = typer.Option(True, "--chunks/--no-chunks", help="Also vectorize chunks"),
+    confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """
+    Fast re-vectorization using GTE (no SLM refinement).
+
+    Updates vectors table with new 768-dim embeddings.
+    Much faster than refine-reindex (minutes vs hours).
+
+    Examples:
+        crec revectorize --yes
+        crec revectorize --limit 1000 --yes
+        crec revectorize --no-chunks --yes
+    """
+    import pickle
+
+    try:
+        console.print("[bold cyan]Fast Re-vectorization (GTE only)[/bold cyan]\n")
+
+        # Load configuration
+        cfg = ConfigLoader.load(config)
+
+        # Initialize storage
+        storage_config = cfg['components']['storage']['config']
+        storage = SQLiteVectorStorage(config=storage_config)
+        conn = storage._connect()
+
+        # Count items to process
+        cursor = conn.execute("""
+            SELECT COUNT(*) FROM vectors WHERE vector_dim != 768 OR vector_dim IS NULL
+        """)
+        messages_pending = cursor.fetchone()[0]
+
+        chunks_pending = 0
+        if include_chunks:
+            cursor = conn.execute("""
+                SELECT COUNT(*) FROM message_chunks
+                WHERE chunk_id NOT IN (SELECT entity_id FROM vectors WHERE entity_type = 'chunk')
+            """)
+            chunks_pending = cursor.fetchone()[0]
+
+        total = messages_pending + chunks_pending
+        if limit:
+            total = min(total, limit)
+
+        console.print(f"Messages pending: {messages_pending:,}")
+        if include_chunks:
+            console.print(f"Chunks pending: {chunks_pending:,}")
+        console.print(f"Total to process: {total:,}")
+
+        if total == 0:
+            console.print("\n[green]All items already vectorized with 768-dim![/green]")
+            return
+
+        if not confirm:
+            console.print("\n[yellow]Use --yes to confirm[/yellow]")
+            return
+
+        # CUDA memory management
+        import gc
+        import torch
+
+        # Clear CUDA cache before loading
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Load vectorizer
+        vectorizer_config = cfg['components']['vectorizer']['config']
+        vectorizer = SentenceTransformerVectorizer(config=vectorizer_config)
+        vectorizer.load()
+
+        model_version = f"{vectorizer_config.get('model', 'unknown')}_dim768"
+
+        from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+
+        processed = 0
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task("Vectorizing...", total=total)
+
+            # Process messages
+            limit_clause = f"LIMIT {limit}" if limit else ""
+            cursor = conn.execute(f"""
+                SELECT v.entity_id, mc.vectorizable_content
+                FROM vectors v
+                JOIN message_content mc ON v.entity_id = mc.message_id
+                WHERE v.entity_type = 'message' AND (v.vector_dim != 768 OR v.vector_dim IS NULL)
+                {limit_clause}
+            """)
+
+            batch_ids = []
+            batch_texts = []
+
+            MAX_TEXT_LEN = 8000  # Truncate to avoid OOM on very long texts
+
+            for row in cursor:
+                batch_ids.append(row[0])
+                text = row[1] or ''
+                if len(text) > MAX_TEXT_LEN:
+                    text = text[:MAX_TEXT_LEN]
+                batch_texts.append(text)
+
+                if len(batch_ids) >= batch_size:
+                    # Vectorize batch
+                    vectors = vectorizer.vectorize_batch(batch_texts)
+
+                    # Update vectors table
+                    for entity_id, vec in zip(batch_ids, vectors):
+                        vec_blob = pickle.dumps(vec)
+                        conn.execute("""
+                            UPDATE vectors
+                            SET vector = ?, vector_dim = 768, model_version = ?
+                            WHERE entity_id = ? AND entity_type = 'message'
+                        """, (vec_blob, model_version, entity_id))
+
+                    conn.commit()
+                    processed += len(batch_ids)
+                    progress.update(task, advance=len(batch_ids))
+                    batch_ids = []
+                    batch_texts = []
+
+                    # Clear CUDA cache periodically to prevent fragmentation
+                    if processed % (batch_size * 10) == 0:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                    if limit and processed >= limit:
+                        break
+
+            # Process remaining batch
+            if batch_ids and (not limit or processed < limit):
+                vectors = vectorizer.vectorize_batch(batch_texts)
+                for entity_id, vec in zip(batch_ids, vectors):
+                    vec_blob = pickle.dumps(vec)
+                    conn.execute("""
+                        UPDATE vectors
+                        SET vector = ?, vector_dim = 768, model_version = ?
+                        WHERE entity_id = ? AND entity_type = 'message'
+                    """, (vec_blob, model_version, entity_id))
+                conn.commit()
+                processed += len(batch_ids)
+                progress.update(task, advance=len(batch_ids))
+
+            # Process chunks if enabled
+            if include_chunks and (not limit or processed < limit):
+                remaining = (limit - processed) if limit else None
+                chunk_limit = f"LIMIT {remaining}" if remaining else ""
+
+                cursor = conn.execute(f"""
+                    SELECT chunk_id, chunk_text
+                    FROM message_chunks
+                    WHERE chunk_id NOT IN (SELECT entity_id FROM vectors WHERE entity_type = 'chunk')
+                    {chunk_limit}
+                """)
+
+                batch_ids = []
+                batch_texts = []
+
+                for row in cursor:
+                    batch_ids.append(row[0])
+                    batch_texts.append(row[1] or '')
+
+                    if len(batch_ids) >= batch_size:
+                        vectors = vectorizer.vectorize_batch(batch_texts)
+
+                        for chunk_id, vec in zip(batch_ids, vectors):
+                            vec_blob = pickle.dumps(vec)
+                            conn.execute("""
+                                INSERT OR REPLACE INTO vectors
+                                (entity_id, entity_type, vector, vector_dim, model_version)
+                                VALUES (?, 'chunk', ?, 768, ?)
+                            """, (chunk_id, vec_blob, model_version))
+
+                        conn.commit()
+                        processed += len(batch_ids)
+                        progress.update(task, advance=len(batch_ids))
+                        batch_ids = []
+                        batch_texts = []
+
+                        # Clear CUDA cache periodically
+                        if processed % (batch_size * 10) == 0:
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
+                # Remaining chunks
+                if batch_ids:
+                    vectors = vectorizer.vectorize_batch(batch_texts)
+                    for chunk_id, vec in zip(batch_ids, vectors):
+                        vec_blob = pickle.dumps(vec)
+                        conn.execute("""
+                            INSERT OR REPLACE INTO vectors
+                            (entity_id, entity_type, vector, vector_dim, model_version)
+                            VALUES (?, 'chunk', ?, 768, ?)
+                        """, (chunk_id, vec_blob, model_version))
+                    conn.commit()
+                    processed += len(batch_ids)
+                    progress.update(task, advance=len(batch_ids))
+
+        vectorizer.unload()
+
+        console.print(f"\n[bold green]✓ Vectorized {processed:,} items[/bold green]")
+        console.print(f"  Model: {vectorizer_config.get('model')}")
+        console.print(f"  Dimension: 768")
+
+    except Exception as e:
+        console.print(f"\n[bold red]✗ Error:[/bold red] {e}")
+        import traceback
+        traceback.print_exc()
         raise typer.Exit(1)
 
 

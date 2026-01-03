@@ -76,6 +76,8 @@ class SentenceTransformerVectorizer(IVectorizer):
                 # Return known dimension for common models
                 if "MiniLM-L6" in self.model_name:
                     return 384
+                elif "gte-multilingual" in self.model_name.lower():
+                    return 768
                 elif "mpnet" in self.model_name:
                     return 768
                 else:
@@ -90,7 +92,16 @@ class SentenceTransformerVectorizer(IVectorizer):
 
         print(f"Loading vectorizer model: {self.model_name} on {self.device}...")
 
-        self.model = SentenceTransformer(self.model_name, device=self.device)
+        # GTE and some models require trust_remote_code
+        trust_remote = "gte" in self.model_name.lower() or self.config.get("trust_remote_code", False)
+        if trust_remote:
+            print(f"  [!] trust_remote_code=True (required by {self.model_name})")
+
+        self.model = SentenceTransformer(
+            self.model_name,
+            device=self.device,
+            trust_remote_code=trust_remote
+        )
         self._embedding_dim = self.model.get_sentence_embedding_dimension()
 
         # Estimate memory usage
@@ -101,12 +112,13 @@ class SentenceTransformerVectorizer(IVectorizer):
             # Rough estimate for CPU
             model_size_map = {
                 "MiniLM-L6": 600,
+                "gte-multilingual": 1500,
                 "mpnet": 1100,
                 "e5-large": 2500,
             }
             self._memory_mb = 600  # Default
             for key, size in model_size_map.items():
-                if key in self.model_name:
+                if key.lower() in self.model_name.lower():
                     self._memory_mb = size
                     break
 

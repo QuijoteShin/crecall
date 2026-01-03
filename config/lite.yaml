@@ -1,5 +1,5 @@
 # config/lite.yaml
-# Lightweight profile - Rule-based classifier, fast loading
+# Lightweight profile - Rule-based classifier, CPU refiner (slow but no GPU required)
 
 components:
   format_detector:
@@ -22,12 +22,23 @@ components:
     class: "src.classifiers.rule_based.RuleBasedClassifier"
     config: {}
 
-  # Vectorizer still uses GPU for quality
+  # LITE: Refiner on CPU (slow but works without GPU)
+  # Comment out to disable refinement entirely
+  # refiner:
+  #   class: "src.refiners.llama_cpp.LlamaCppRefiner"
+  #   config:
+  #     model_path: "models/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+  #     n_gpu_layers: 0  # CPU only
+  #     n_ctx: 1024  # Reduced context for speed
+  #     max_tokens: 150
+  #     batch_size: 4
+
+  # GTE vectorizer (better quality, GPU accelerated)
   vectorizer:
     class: "src.vectorizers.sentence_transformer.SentenceTransformerVectorizer"
     config:
-      model: "sentence-transformers/all-MiniLM-L6-v2"
-      batch_size: 128  # Larger batches since no classifier GPU conflict
+      model: "Alibaba-NLP/gte-multilingual-base"
+      batch_size: 128
       device: "cuda"
 
   storage:
@@ -48,6 +59,8 @@ pipeline:
       components: ["classifier"]
       gc_after: false  # Rule-based, no GPU to clear
 
+    # Refine stage will be skipped if refiner not configured
+
     - name: "vectorize"
       components: ["vectorizer"]
       gc_after: true
@@ -57,7 +70,8 @@ pipeline:
       components: ["storage"]
 
 memory:
-  concurrent_models: false
+  context_aware: true
+  safety_margin_mb: 500
   force_gc_between_stages: true
   cuda_empty_cache_between_stages: true
   memory_profiling: true

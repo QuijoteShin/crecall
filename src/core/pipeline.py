@@ -17,9 +17,11 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from .registry import ComponentRegistry
+from .memory_manager import MemoryManager
 from ..contracts.importer import IImporter
 from ..contracts.normalizer import INormalizer
 from ..contracts.classifier import IClassifier
+from ..contracts.refiner import IRefiner
 from ..contracts.vectorizer import IVectorizer
 from ..contracts.storage import IStorage
 from ..models.normalized import NormalizedMessage
@@ -37,12 +39,14 @@ class Pipeline:
     1. Import: Read source and yield NormalizedMessage
     2. Normalize: Clean content for UI and vectorization
     3. Classify: Determine intent and extract topics (GPU Stage 1)
-    4. Vectorize: Generate embeddings (GPU Stage 2)
-    5. Persist: Store in database
+    4. Refine: Extract semantic intent using SLM (GPU Stage 2) [Optional]
+    5. Vectorize: Generate embeddings (GPU Stage 3)
+    6. Persist: Store in database
 
     Memory Management:
-    - Only ONE GPU model loaded at a time
-    - GC + CUDA cache clearing between stages
+    - Context-aware MemoryManager for GPU resource optimization
+    - Avoids thrashing by keeping models loaded when needed by next stage
+    - GC + CUDA cache clearing between unrelated stages
     - Memory profiling logged to memory_profile.log
     """
 
@@ -50,6 +54,7 @@ class Pipeline:
         self.config = config
         self.registry = registry
         self.memory_log: List[Dict] = []
+        self.memory_manager = MemoryManager(config.get('memory', {}))
 
     def process_source(self, source_path: Path) -> Dict[str, Any]:
         """
@@ -88,11 +93,15 @@ class Pipeline:
             classified_messages = self._stage_classify(normalized_messages)
             self._cleanup_memory("After Classification")
 
-            # Stage 4: Vectorize (GPU Stage 2)
-            vectorized_messages = self._stage_vectorize(classified_messages)
+            # Stage 4: Refine (GPU Stage 2) - Optional
+            refined_messages = self._stage_refine(classified_messages)
+            # Note: No cleanup here if vectorizer uses same GPU (context-aware)
+
+            # Stage 5: Vectorize (GPU Stage 3)
+            vectorized_messages = self._stage_vectorize(refined_messages)
             self._cleanup_memory("After Vectorization")
 
-            # Stage 5: Persist
+            # Stage 6: Persist
             message_ids = self._stage_persist(vectorized_messages)
             stats['messages_stored'] = len(message_ids)
 
@@ -205,6 +214,20 @@ class Pipeline:
 
         Returns: List of (NormalizedMessage, clean_content, vectorizable_content, Classification)
         """
+        # Check if classifier is configured (optional stage)
+        if 'classifier' not in self.config.get('components', {}):
+            console.print("\n[bold]Stage 3: Classify[/bold] [dim](skipped - not configured)[/dim]")
+            # Return with default classification
+            from ..models.processed import Classification
+            default_classification = Classification(
+                intent='unknown',
+                confidence=0.0,
+                topics=[],
+                is_question=False,
+                is_command=False
+            )
+            return [(msg, clean, vectorizable, default_classification) for msg, clean, vectorizable in normalized]
+
         console.print("\n[bold]Stage 3: Classify[/bold]")
         self._log_memory("Before Classifier Load")
 
@@ -256,13 +279,87 @@ class Pipeline:
         console.print(f"  [green]✓[/green] Classified {len(classified)} messages")
         return classified
 
-    def _stage_vectorize(self, classified: List[tuple]) -> List[ProcessedMessage]:
+    def _stage_refine(self, classified: List[tuple]) -> List[tuple]:
         """
-        Stage 4: Generate embeddings (GPU Stage 2).
+        Stage 4: Semantic Refinement using SLM (GPU Stage 2).
+
+        Extracts semantic intent from vectorizable_content using a local SLM.
+        This produces refined_content which is semantically dense and optimized
+        for vectorization.
+
+        Returns: List of (NormalizedMessage, clean_content, vectorizable_content, Classification, refined_content)
+        """
+        # Check if refiner is configured
+        if 'refiner' not in self.config.get('components', {}):
+            console.print("\n[bold]Stage 4: Refine[/bold] [dim](skipped - not configured)[/dim]")
+            # Pass through without refinement - use vectorizable_content as refined
+            return [
+                (msg, clean, vectorizable, classification, vectorizable)
+                for msg, clean, vectorizable, classification in classified
+            ]
+
+        console.print("\n[bold]Stage 4: Refine[/bold]")
+        self._log_memory("Before Refiner Load")
+
+        # Get refiner
+        refiner_config = self.config['components']['refiner']
+        refiner: IRefiner = self.registry.create_instance(
+            name='refiner',
+            class_path=refiner_config['class'],
+            config=refiner_config.get('config', {})
+        )
+
+        # Load model
+        refiner.load()
+        self._log_memory("After Refiner Load")
+
+        refined = []
+        batch_size = refiner_config.get('config', {}).get('batch_size', 8)
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task("Refining messages...", total=len(classified))
+
+            for i in range(0, len(classified), batch_size):
+                batch = classified[i:i + batch_size]
+
+                # Extract texts for refinement
+                texts = [item[2] for item in batch]  # vectorizable_content
+
+                # Refine batch
+                refinements = refiner.refine_batch(texts)
+
+                # Combine results
+                for (msg, clean, vectorizable, classification), refinement in zip(batch, refinements):
+                    refined.append((
+                        msg, clean, vectorizable, classification,
+                        refinement.refined_content
+                    ))
+
+                progress.update(task, advance=len(batch))
+
+        # Unload model (unless next stage can share GPU)
+        # For now, unload - MemoryManager integration can optimize later
+        refiner.unload()
+        self._log_memory("After Refiner Unload")
+
+        console.print(f"  [green]✓[/green] Refined {len(refined)} messages")
+        return refined
+
+    def _stage_vectorize(self, refined: List[tuple]) -> List[ProcessedMessage]:
+        """
+        Stage 5: Generate embeddings (GPU Stage 3).
+
+        Vectorizes the refined_content (semantic intent) instead of raw text.
 
         Returns: List of ProcessedMessage with vectors
         """
-        console.print("\n[bold]Stage 4: Vectorize[/bold]")
+        console.print("\n[bold]Stage 5: Vectorize[/bold]")
         self._log_memory("Before Vectorizer Load")
 
         # Get vectorizer
@@ -286,28 +383,29 @@ class Pipeline:
             TaskProgressColumn(),
             console=console
         ) as progress:
-            task = progress.add_task("Vectorizing messages...", total=len(classified))
+            task = progress.add_task("Vectorizing messages...", total=len(refined))
 
             # Batch vectorization
             batch_size = vectorizer_config.get('config', {}).get('batch_size', 64)
 
-            for i in range(0, len(classified), batch_size):
-                batch = classified[i:i + batch_size]
+            for i in range(0, len(refined), batch_size):
+                batch = refined[i:i + batch_size]
 
-                # Extract texts for vectorization
-                texts = [item[2] for item in batch]  # vectorizable_content
+                # Extract refined_content for vectorization (index 4)
+                texts = [item[4] for item in batch]  # refined_content
 
                 # Vectorize batch
                 vectors = vectorizer.vectorize_batch(texts)
 
                 # Create ProcessedMessage objects
-                for (msg, clean, vectorizable, classification), vector in zip(batch, vectors):
+                for (msg, clean, vectorizable, classification, refined_content), vector in zip(batch, vectors):
                     processed_msg = ProcessedMessage(
                         normalized=msg,
                         clean_content=clean,
                         vectorizable_content=vectorizable,
                         classification=classification,
                         vector=vector,
+                        refined_content=refined_content,
                     )
                     processed.append(processed_msg)
 
@@ -321,8 +419,8 @@ class Pipeline:
         return processed
 
     def _stage_persist(self, messages: List[ProcessedMessage]) -> List[str]:
-        """Stage 5: Store in database."""
-        console.print("\n[bold]Stage 5: Persist[/bold]")
+        """Stage 6: Store in database."""
+        console.print("\n[bold]Stage 6: Persist[/bold]")
 
         # Get storage
         storage_config = self.config['components']['storage']

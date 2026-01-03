@@ -38,6 +38,7 @@ class ProcessedMessage:
     vectorizable_content: str  # After soft sanitization (for embeddings)
     classification: Classification
     vector: Optional[np.ndarray] = None
+    refined_content: Optional[str] = None  # SLM-extracted semantic intent for vectorization
 
     def to_dict(self, include_vector: bool = False) -> dict:
         """
@@ -50,6 +51,7 @@ class ProcessedMessage:
             'normalized': self.normalized.to_dict(),
             'clean_content': self.clean_content,
             'vectorizable_content': self.vectorizable_content,
+            'refined_content': self.refined_content,
             'classification': {
                 'intent': self.classification.intent,
                 'confidence': self.classification.confidence,
@@ -87,4 +89,5 @@ class ProcessedMessage:
             vectorizable_content=data['vectorizable_content'],
             classification=classification,
             vector=vector,
+            refined_content=data.get('refined_content'),
         )

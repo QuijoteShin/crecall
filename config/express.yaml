@@ -1,5 +1,5 @@
 # config/express.yaml
-# Express profile - Vectorization only, ultra-fast
+# Express profile - GTE vectorization only, no SLM refinement (faster)
 
 components:
   format_detector:
@@ -17,13 +17,15 @@ components:
       fallback_on_error: true
       preserve_code_blocks: true
 
-  # EXPRESS: No classifier (can add later with `reindex`)
+  # EXPRESS: No classifier or refiner (can add later with `refine-reindex`)
   # classifier: null
+  # refiner: null
 
+  # GTE vectorizer (better quality than MiniLM)
   vectorizer:
     class: "src.vectorizers.sentence_transformer.SentenceTransformerVectorizer"
     config:
-      model: "sentence-transformers/all-MiniLM-L6-v2"
+      model: "Alibaba-NLP/gte-multilingual-base"
       batch_size: 128
       device: "cuda"
 
@@ -41,7 +43,7 @@ pipeline:
       components: ["normalizer"]
       gc_after: false
 
-    # Skip classify stage
+    # Skip classify and refine stages for speed
 
     - name: "vectorize"
       components: ["vectorizer"]
@@ -52,7 +54,8 @@ pipeline:
       components: ["storage"]
 
 memory:
-  concurrent_models: false
+  context_aware: true
+  safety_margin_mb: 500
   force_gc_between_stages: true
   cuda_empty_cache_between_stages: true
   memory_profiling: true

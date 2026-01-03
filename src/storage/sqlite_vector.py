@@ -75,6 +75,9 @@ class SQLiteVectorStorage(IStorage):
                 is_question INTEGER NOT NULL,
                 is_command INTEGER NOT NULL,
 
+                -- Semantic Refinement (SLM output)
+                refined_content TEXT,  -- SLM-extracted intent for vectorization
+
                 -- Semantic Segmentation (HCS Layer)
                 segment_id TEXT,  -- Segment identifier (e.g., "conv123_seg1")
                 segment_topic TEXT,  -- Auto-generated topic label (e.g., "Salud Visual")
@@ -147,6 +150,7 @@ class SQLiteVectorStorage(IStorage):
                 content,
                 clean_content,
                 vectorizable_content,
+                refined_content,
                 content='messages',
                 content_rowid='rowid'
             )
@@ -155,10 +159,13 @@ class SQLiteVectorStorage(IStorage):
         # FTS triggers
         conn.execute("""
             CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
-                INSERT INTO messages_fts(rowid, id, content, clean_content, vectorizable_content)
-                VALUES (new.rowid, new.id, new.content, new.clean_content, new.vectorizable_content);
+                INSERT INTO messages_fts(rowid, id, content, clean_content, vectorizable_content, refined_content)
+                VALUES (new.rowid, new.id, new.content, new.clean_content, new.vectorizable_content, new.refined_content);
             END
         """)
+
+        # Note: UPDATE/DELETE triggers don't work reliably with FTS5 external content tables.
+        # Use rebuild_fts_index() after batch updates instead.
 
         conn.commit()
         print("✓ Database initialized")
@@ -180,6 +187,7 @@ class SQLiteVectorStorage(IStorage):
             'content': message.normalized.content,
             'clean_content': message.clean_content,
             'vectorizable_content': message.vectorizable_content,
+            'refined_content': message.refined_content,
             'content_type': message.normalized.content_type,
             'timestamp': message.normalized.timestamp.isoformat(),
             'parent_message_id': message.normalized.parent_message_id,
@@ -195,11 +203,11 @@ class SQLiteVectorStorage(IStorage):
         conn.execute("""
             INSERT OR REPLACE INTO messages (
                 id, conversation_id, author_role, content, clean_content, vectorizable_content,
-                content_type, timestamp, parent_message_id, intent, intent_confidence,
+                refined_content, content_type, timestamp, parent_message_id, intent, intent_confidence,
                 topics, is_question, is_command, metadata, vector
             ) VALUES (
                 :id, :conversation_id, :author_role, :content, :clean_content, :vectorizable_content,
-                :content_type, :timestamp, :parent_message_id, :intent, :intent_confidence,
+                :refined_content, :content_type, :timestamp, :parent_message_id, :intent, :intent_confidence,
                 :topics, :is_question, :is_command, :metadata, :vector
             )
         """, data)
@@ -226,6 +234,7 @@ class SQLiteVectorStorage(IStorage):
                 'content': message.normalized.content,
                 'clean_content': message.clean_content,
                 'vectorizable_content': message.vectorizable_content,
+                'refined_content': message.refined_content,
                 'content_type': message.normalized.content_type,
                 'timestamp': message.normalized.timestamp.isoformat(),
                 'parent_message_id': message.normalized.parent_message_id,
@@ -241,11 +250,11 @@ class SQLiteVectorStorage(IStorage):
             conn.execute("""
                 INSERT OR REPLACE INTO messages (
                     id, conversation_id, author_role, content, clean_content, vectorizable_content,
-                    content_type, timestamp, parent_message_id, intent, intent_confidence,
+                    refined_content, content_type, timestamp, parent_message_id, intent, intent_confidence,
                     topics, is_question, is_command, metadata, vector
                 ) VALUES (
                     :id, :conversation_id, :author_role, :content, :clean_content, :vectorizable_content,
-                    :content_type, :timestamp, :parent_message_id, :intent, :intent_confidence,
+                    :refined_content, :content_type, :timestamp, :parent_message_id, :intent, :intent_confidence,
                     :topics, :is_question, :is_command, :metadata, :vector
                 )
             """, data)
@@ -261,47 +270,57 @@ class SQLiteVectorStorage(IStorage):
         limit: int = 10,
         filters: Optional[dict] = None
     ) -> List[SearchResult]:
-        """Vector similarity search."""
+        """Vector similarity search using disaggregated vectors table."""
         conn = self._connect()
+        query_dim = len(query_vector)
 
-        # Build filter WHERE clause
-        where_clauses = ["vector IS NOT NULL"]
-        params = {}
+        # Build filter WHERE clause for messages
+        where_clauses = []
+        params = {'query_dim': query_dim}
 
         if filters:
             if 'conversation_id' in filters:
-                where_clauses.append("conversation_id = :conversation_id")
+                where_clauses.append("m.conversation_id = :conversation_id")
                 params['conversation_id'] = filters['conversation_id']
             if 'intent' in filters:
-                where_clauses.append("intent = :intent")
+                where_clauses.append("m.intent = :intent")
                 params['intent'] = filters['intent']
             if 'segment_topic' in filters:
-                where_clauses.append("segment_topic = :segment_topic")
+                where_clauses.append("m.segment_topic = :segment_topic")
                 params['segment_topic'] = filters['segment_topic']
 
-        where_sql = f"WHERE {' AND '.join(where_clauses)}"
+        where_sql = f"AND {' AND '.join(where_clauses)}" if where_clauses else ""
 
-        # Fetch all messages with vectors
+        # Use vectors table (new schema) with dimension filter
+        # Note: Alias v.vector as vec to avoid conflict with m.vector (legacy)
         cursor = conn.execute(f"""
-            SELECT * FROM messages
+            SELECT m.id, m.conversation_id, m.author_role, m.content, m.content_type,
+                   m.timestamp, m.metadata, m.parent_message_id, m.clean_content,
+                   m.vectorizable_content, m.refined_content, m.intent, m.intent_confidence,
+                   m.topics, m.segment_id, m.segment_topic, m.segment_sequence,
+                   v.vector as vec
+            FROM messages m
+            JOIN vectors v ON m.id = v.entity_id AND v.entity_type = 'message'
+            WHERE v.vector_dim = :query_dim
             {where_sql}
         """, params)
 
         results = []
+
         for row in cursor:
-            # Deserialize vector
-            stored_vector = pickle.loads(row['vector'])
+            # Deserialize vector from 'vec' alias (not legacy 'vector')
+            stored_vector = pickle.loads(row['vec'])
 
             # Calculate cosine similarity (vectors are normalized)
             similarity = float(np.dot(query_vector, stored_vector))
 
-            # Reconstruct ProcessedMessage
-            message = self._row_to_processed_message(row)
+            # Reconstruct ProcessedMessage (pass vec as vector for compatibility)
+            message = self._row_to_processed_message_from_search(row, stored_vector)
 
             results.append(SearchResult(
                 message=message,
                 score=similarity,
-                rank=0,  # Will be set after sorting
+                rank=0,
                 matched_on='vector'
             ))
 
@@ -456,12 +475,58 @@ class SQLiteVectorStorage(IStorage):
             topics=json.loads(row['topics']),
         )
 
+        # Get refined_content if available (backward compatible)
+        refined_content = None
+        if 'refined_content' in row.keys():
+            refined_content = row['refined_content']
+
         return ProcessedMessage(
             normalized=normalized,
             clean_content=row['clean_content'],
             vectorizable_content=row['vectorizable_content'],
             classification=classification,
             vector=vector,
+            refined_content=refined_content,
+        )
+
+    def _row_to_processed_message_from_search(self, row: sqlite3.Row, vector: np.ndarray) -> ProcessedMessage:
+        """Convert search result row to ProcessedMessage (vector passed explicitly)."""
+        from datetime import datetime
+
+        # Reconstruct normalized message with segment info
+        metadata = json.loads(row['metadata'])
+
+        if 'segment_topic' in row.keys() and row['segment_topic']:
+            metadata['segment_topic'] = row['segment_topic']
+            metadata['segment_id'] = row['segment_id']
+            metadata['segment_sequence'] = row['segment_sequence']
+
+        normalized = NormalizedMessage(
+            id=row['id'],
+            conversation_id=row['conversation_id'],
+            author_role=row['author_role'],
+            content=row['content'],
+            content_type=row['content_type'],
+            timestamp=datetime.fromisoformat(row['timestamp']),
+            metadata=metadata,
+            parent_message_id=row['parent_message_id'],
+        )
+
+        classification = Classification(
+            intent=row['intent'],
+            confidence=row['intent_confidence'],
+            topics=json.loads(row['topics']),
+        )
+
+        refined_content = row['refined_content'] if 'refined_content' in row.keys() else None
+
+        return ProcessedMessage(
+            normalized=normalized,
+            clean_content=row['clean_content'],
+            vectorizable_content=row['vectorizable_content'],
+            classification=classification,
+            vector=vector,
+            refined_content=refined_content,
         )
 
     # Deduplication & Re-indexing methods
@@ -616,6 +681,158 @@ class SQLiteVectorStorage(IStorage):
             pass
 
         conn.commit()
+
+    def migrate_add_refined_content_column(self) -> None:
+        """Add refined_content column for semantic refinement output."""
+        conn = self._connect()
+
+        # Add column
+        try:
+            conn.execute("ALTER TABLE messages ADD COLUMN refined_content TEXT")
+            print("✓ Added column: refined_content")
+        except Exception:
+            print("  Column refined_content already exists")
+
+        # Rebuild FTS to include refined_content
+        try:
+            conn.execute("DROP TRIGGER IF EXISTS messages_fts_insert")
+            conn.execute("DROP TRIGGER IF EXISTS messages_fts_update")
+            conn.execute("DROP TRIGGER IF EXISTS messages_fts_delete")
+            conn.execute("DROP TABLE IF EXISTS messages_fts")
+
+            conn.execute("""
+                CREATE VIRTUAL TABLE messages_fts USING fts5(
+                    id UNINDEXED,
+                    content,
+                    clean_content,
+                    vectorizable_content,
+                    refined_content,
+                    content='messages',
+                    content_rowid='rowid'
+                )
+            """)
+
+            conn.execute("""
+                CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+                    INSERT INTO messages_fts(rowid, id, content, clean_content, vectorizable_content, refined_content)
+                    VALUES (new.rowid, new.id, new.content, new.clean_content, new.vectorizable_content, new.refined_content);
+                END
+            """)
+
+            # Note: UPDATE/DELETE triggers don't work reliably with FTS5 external content.
+            # Use rebuild_fts_index() after batch updates instead.
+
+            # Rebuild FTS index from existing data
+            conn.execute("""
+                INSERT INTO messages_fts(rowid, id, content, clean_content, vectorizable_content, refined_content)
+                SELECT rowid, id, content, clean_content, vectorizable_content, refined_content FROM messages
+            """)
+
+            print("✓ Rebuilt FTS index with refined_content")
+        except Exception as e:
+            print(f"  FTS rebuild warning: {e}")
+
+        conn.commit()
+
+    def update_refined_content_batch(
+        self,
+        updates: List[Dict[str, Any]]
+    ) -> int:
+        """
+        Batch update refined_content and vector for re-indexing.
+
+        Args:
+            updates: List of dicts with keys: message_id, refined_content, vector (optional)
+
+        Returns:
+            Number of messages updated
+        """
+        conn = self._connect()
+        count = 0
+
+        for update in updates:
+            message_id = update['message_id']
+            refined_content = update.get('refined_content')
+            vector = update.get('vector')
+
+            if vector is not None:
+                vector_blob = pickle.dumps(vector)
+                conn.execute("""
+                    UPDATE messages
+                    SET refined_content = ?, vector = ?
+                    WHERE id = ?
+                """, (refined_content, vector_blob, message_id))
+            else:
+                conn.execute("""
+                    UPDATE messages
+                    SET refined_content = ?
+                    WHERE id = ?
+                """, (refined_content, message_id))
+
+            count += 1
+
+        conn.commit()
+        return count
+
+    def rebuild_fts_index(self) -> None:
+        """
+        Rebuild the FTS index from the messages table.
+
+        Call this after batch updates since FTS5 external content tables
+        don't support UPDATE triggers reliably.
+        """
+        conn = self._connect()
+
+        # Drop and recreate the FTS table with fresh data
+        conn.execute("DROP TABLE IF EXISTS messages_fts")
+        conn.execute("""
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                id UNINDEXED,
+                content,
+                clean_content,
+                vectorizable_content,
+                refined_content,
+                content='messages',
+                content_rowid='rowid'
+            )
+        """)
+
+        # Populate from messages table
+        conn.execute("""
+            INSERT INTO messages_fts(rowid, id, content, clean_content, vectorizable_content, refined_content)
+            SELECT rowid, id, content, clean_content, vectorizable_content, refined_content FROM messages
+        """)
+
+        conn.commit()
+
+    def get_messages_for_refinement(
+        self,
+        limit: Optional[int] = None,
+        only_unrefined: bool = True
+    ) -> List[ProcessedMessage]:
+        """
+        Get messages that need refinement processing.
+
+        Args:
+            limit: Max messages to return
+            only_unrefined: If True, only get messages without refined_content
+
+        Returns:
+            List of ProcessedMessage objects
+        """
+        conn = self._connect()
+
+        where_clause = "WHERE refined_content IS NULL" if only_unrefined else ""
+        limit_clause = f"LIMIT {limit}" if limit else ""
+
+        cursor = conn.execute(f"""
+            SELECT * FROM messages
+            {where_clause}
+            ORDER BY created_at DESC
+            {limit_clause}
+        """)
+
+        return [self._row_to_processed_message(row) for row in cursor]
 
     def get_conversations_for_segmentation(self) -> List[str]:
         """Get list of conversation IDs that need segmentation."""

@@ -1,5 +1,5 @@
 # config/default.yaml
-# Default configuration for DRecall
+# Default configuration for ChatRecall with Semantic Refinement
 
 # Component configuration (all swappable via interfaces)
 components:
@@ -27,15 +27,26 @@ components:
     config:
       model: "valhalla/distilbart-mnli-12-1"
       batch_size: 32
-      device: "cuda"  # or "cpu"
+      device: "cuda"
 
-  # Text vectorizer
+  # Semantic refiner (SLM for intent extraction)
+  refiner:
+    class: "src.refiners.llama_cpp.LlamaCppRefiner"
+    config:
+      model_path: "models/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+      n_gpu_layers: -1  # -1 = all layers to GPU
+      n_ctx: 2048
+      max_tokens: 200
+      batch_size: 8
+      temperature: 0.1
+
+  # Text vectorizer (GTE multilingual for better Spanish support)
   vectorizer:
     class: "src.vectorizers.sentence_transformer.SentenceTransformerVectorizer"
     config:
-      model: "sentence-transformers/all-MiniLM-L6-v2"
+      model: "Alibaba-NLP/gte-multilingual-base"
       batch_size: 64
-      device: "cuda"  # or "cpu"
+      device: "cuda"
 
   # Storage backend
   storage:
@@ -59,6 +70,11 @@ pipeline:
       gc_after: true
       cuda_empty_cache: true
 
+    - name: "refine"
+      components: ["refiner"]
+      gc_after: false  # Keep GPU warm for vectorizer
+      cuda_empty_cache: false
+
     - name: "vectorize"
       components: ["vectorizer"]
       gc_after: true
@@ -69,8 +85,11 @@ pipeline:
 
 # Memory management
 memory:
-  # Only load one GPU model at a time
-  concurrent_models: false
+  # Context-aware memory management
+  context_aware: true
+
+  # Safety margin in MB (reserved for system)
+  safety_margin_mb: 500
 
   # Force garbage collection between stages
   force_gc_between_stages: true
