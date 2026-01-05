@@ -21,13 +21,13 @@ components:
       fallback_on_error: true
       preserve_code_blocks: true
 
-  # Intent classifier
-  classifier:
-    class: "src.classifiers.transformer.TransformerClassifier"
-    config:
-      model: "valhalla/distilbart-mnli-12-1"
-      batch_size: 32
-      device: "cuda"
+  # Intent classifier - ELIMINADO: Qwen hace single-pass con intent+topics+is_question
+  # classifier:
+  #   class: "src.classifiers.transformer.TransformerClassifier"
+  #   config:
+  #     model: "valhalla/distilbart-mnli-12-1"
+  #     batch_size: 32
+  #     device: "cuda"
 
   # Semantic refiner (SLM for intent extraction)
   refiner:
@@ -65,10 +65,7 @@ pipeline:
       components: ["normalizer"]
       gc_after: false
 
-    - name: "classify"
-      components: ["classifier"]
-      gc_after: true
-      cuda_empty_cache: true
+    # Stage classify ELIMINADO - Qwen hace single-pass
 
     - name: "refine"
       components: ["refiner"]

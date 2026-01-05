@@ -287,8 +287,13 @@ class Pipeline:
         This produces refined_content which is semantically dense and optimized
         for vectorization.
 
+        When classifier is not configured, Qwen also provides classification
+        (intent, topics, is_question) in single-pass mode.
+
         Returns: List of (NormalizedMessage, clean_content, vectorizable_content, Classification, refined_content)
         """
+        from ..models.processed import Classification
+
         # Check if refiner is configured
         if 'refiner' not in self.config.get('components', {}):
             console.print("\n[bold]Stage 4: Refine[/bold] [dim](skipped - not configured)[/dim]")
@@ -298,7 +303,13 @@ class Pipeline:
                 for msg, clean, vectorizable, classification in classified
             ]
 
-        console.print("\n[bold]Stage 4: Refine[/bold]")
+        # Check if we need to extract classification from refiner (no classifier configured)
+        no_classifier = 'classifier' not in self.config.get('components', {})
+        if no_classifier:
+            console.print("\n[bold]Stage 3+4: Refine (single-pass)[/bold] [dim](Qwen extracts intent + topics + summary)[/dim]")
+        else:
+            console.print("\n[bold]Stage 4: Refine[/bold]")
+
         self._log_memory("Before Refiner Load")
 
         # Get refiner
@@ -336,6 +347,18 @@ class Pipeline:
 
                 # Combine results
                 for (msg, clean, vectorizable, classification), refinement in zip(batch, refinements):
+                    # If no classifier, use Qwen's output to create Classification
+                    if no_classifier and classification.intent == 'unknown':
+                        has_question = refinement.metadata.get('has_question', False)
+                        classification = Classification(
+                            intent=refinement.intent or 'unknown',
+                            confidence=refinement.confidence,
+                            topics=refinement.entities[:10] if refinement.entities else [],
+                            is_question=has_question,
+                            is_command=False,
+                            metadata={'source': 'qwen_single_pass'}
+                        )
+
                     refined.append((
                         msg, clean, vectorizable, classification,
                         refinement.refined_content
