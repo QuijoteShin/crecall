@@ -35,21 +35,37 @@ class LlamaCppRefiner(IRefiner):
     """
 
     DEFAULT_PROMPT_TEMPLATE = """<|im_start|>system
-Eres un analizador semántico. Extrae la esencia del mensaje del usuario.
+Eres un analizador semántico para búsqueda vectorial. Tu trabajo es EXPANDIR y ENRIQUECER el texto para mejorar la recuperación semántica.
+
+REGLAS CRÍTICAS:
+1. EXPANDE siglas y acrónimos según el CONTEXTO del mensaje:
+   - SaaS en contexto tech → Software as a Service / Software como Servicio
+   - API en programación → Application Programming Interface
+   - API en farmacia → Active Pharmaceutical Ingredient
+   - CRM → Customer Relationship Management / Gestión de Clientes
+   - Usa el contexto para desambiguar siglas multi-significado
+2. Incluye sinónimos y términos relacionados del dominio
+3. El resumen debe ser DENSO semánticamente, optimizado para embeddings
+4. DETECTA si hay pregunta o intención de pregunta:
+   - Pregunta explícita: termina con "?" o usa palabras interrogativas
+   - Pregunta implícita: solicita información, ayuda, o clarificación
+   - Una pregunta indica cambio de contexto o nuevo tema jerárquico
 <|im_end|>
 <|im_start|>user
-Analiza el siguiente mensaje y extrae:
-1. Intención principal (máximo 3 palabras)
-2. Entidades clave (lista corta separada por comas)
-3. Resumen en una oración
+Analiza este mensaje y extrae:
+1. Intención (máximo 3 palabras o 2 frases cortas)
+2. Términos clave EXPANDIDOS: siglas → forma completa según contexto + sinónimos
+3. Tiene_Pregunta: SI/NO (detecta preguntas explícitas o implícitas)
+4. Resumen semántico denso (para búsqueda vectorial, no literal)
 
 Mensaje:
 {text}
 
-Responde EXACTAMENTE en este formato (sin explicaciones adicionales):
+Formato EXACTO:
 Intención: [intención]
-Entidades: [entidad1, entidad2, ...]
-Resumen: [resumen]
+Términos: [término1 (expansión contextual), término2, ...]
+Tiene_Pregunta: [SI/NO]
+Resumen: [resumen denso con términos expandidos]
 <|im_end|>
 <|im_start|>assistant
 """
@@ -153,21 +169,39 @@ Resumen: [resumen]
         intent = None
         entities = []
         summary = None
+        has_question = False
+        in_terms_block = False
 
         lines = response.split("\n")
         for line in lines:
             line = line.strip()
             if not line:
+                in_terms_block = False
                 continue
+
+            # Parse multi-line terms block (lines starting with -)
+            if in_terms_block and line.startswith("-"):
+                term = line.lstrip("- ").strip()
+                if term:
+                    entities.append(term)
+                continue
+            elif in_terms_block and not line.startswith("-"):
+                in_terms_block = False
 
             # Parse each field
             if line.lower().startswith("intención:") or line.lower().startswith("intencion:"):
                 intent = re.sub(r"^intenci[oó]n:\s*", "", line, flags=re.IGNORECASE).strip()
-            elif line.lower().startswith("entidades:"):
-                ent_str = re.sub(r"^entidades:\s*", "", line, flags=re.IGNORECASE).strip()
-                # Handle brackets if present
+                intent = intent.strip("[]")
+            elif line.lower().startswith("términos:") or line.lower().startswith("terminos:") or line.lower().startswith("entidades:"):
+                ent_str = re.sub(r"^(t[eé]rminos|entidades):\s*", "", line, flags=re.IGNORECASE).strip()
                 ent_str = ent_str.strip("[]")
-                entities = [e.strip() for e in ent_str.split(",") if e.strip()]
+                if ent_str:
+                    entities = [e.strip() for e in ent_str.split(",") if e.strip()]
+                else:
+                    in_terms_block = True
+            elif line.lower().startswith("tiene_pregunta:"):
+                val = re.sub(r"^tiene_pregunta:\s*", "", line, flags=re.IGNORECASE).strip().upper()
+                has_question = val in ["SI", "SÍ", "YES", "TRUE", "1"]
             elif line.lower().startswith("resumen:"):
                 summary = re.sub(r"^resumen:\s*", "", line, flags=re.IGNORECASE).strip()
 
@@ -176,8 +210,7 @@ Resumen: [resumen]
         if intent:
             parts.append(f"Intención: {intent}")
         if entities:
-            # Limit entities for vector density
-            parts.append(f"Tema: {', '.join(entities[:5])}")
+            parts.append(f"Términos: {', '.join(entities[:8])}")
         if summary:
             parts.append(f"Resumen: {summary}")
 
@@ -195,7 +228,10 @@ Resumen: [resumen]
             entities=entities,
             summary=summary,
             confidence=confidence,
-            metadata={"raw_response": response}
+            metadata={
+                "raw_response": response,
+                "has_question": has_question
+            }
         )
 
     def load(self) -> None:
