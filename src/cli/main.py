@@ -1236,6 +1236,80 @@ def topics(
         raise typer.Exit(1)
 
 
+@app.command(name="reindex-full")
+def reindex_full(
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Custom config file"),
+    force: bool = typer.Option(False, "--force", "-f", help="Re-index ALL messages (not just pending)"),
+    no_resume: bool = typer.Option(False, "--no-resume", help="Start fresh, ignore checkpoint"),
+    batch_size: int = typer.Option(8, "--batch-size", "-b", help="Messages per batch"),
+    checkpoint_interval: int = typer.Option(100, "--checkpoint", help="Save checkpoint every N messages"),
+    status_only: bool = typer.Option(False, "--status", "-s", help="Show status without running"),
+):
+    """
+    Full re-index with checkpointing (resumable).
+
+    Uses the new Qwen prompt with:
+    - Contextual acronym expansion (SaaS → Software as a Service)
+    - Question detection (Tiene_Pregunta)
+    - Single-pass classification + refinement
+
+    Features:
+    - Checkpoint every N messages (default 100)
+    - Resume from last checkpoint on failure/restart
+    - Progress with ETA
+
+    Examples:
+        crec reindex-full --status          # Check status
+        crec reindex-full                   # Resume or start
+        crec reindex-full --force           # Re-index everything
+        crec reindex-full --no-resume       # Start fresh
+        crec reindex-full --batch-size 16   # Larger batches
+    """
+    try:
+        from src.core.reindexer import Reindexer
+
+        # Load configuration
+        cfg = ConfigLoader.load(config)
+
+        # Override checkpoint interval
+        if 'reindex' not in cfg:
+            cfg['reindex'] = {}
+        cfg['reindex']['checkpoint_interval'] = checkpoint_interval
+
+        # Create reindexer
+        registry = ComponentRegistry()
+        reindexer = Reindexer(cfg, registry)
+
+        if status_only:
+            status = reindexer.get_status()
+            console.print("\n[bold]Re-indexing Status[/bold]\n")
+            console.print(f"  Total messages: {status['total_messages']:,}")
+            console.print(f"  Indexed (new format): {status['indexed_new_format']:,}")
+            console.print(f"  Pending: {status['pending']:,}")
+
+            if status['checkpoint']:
+                cp = status['checkpoint']
+                console.print(f"\n  [yellow]Checkpoint found:[/yellow]")
+                console.print(f"    Processed: {cp['processed']}")
+                console.print(f"    Timestamp: {cp['timestamp']}")
+            else:
+                console.print(f"\n  [dim]No checkpoint found[/dim]")
+            return
+
+        # Run reindex
+        stats = reindexer.reindex_all(
+            force=force,
+            resume=not no_resume,
+            batch_size=batch_size
+        )
+
+    except Exception as e:
+        console.print(f"\n[bold red]✗ Error:[/bold red] {e}")
+        import traceback
+        traceback.print_exc()
+        raise typer.Exit(1)
+
+
 @app.command()
 def version():
     """Show version information."""
