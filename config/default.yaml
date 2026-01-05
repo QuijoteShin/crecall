@@ -39,6 +39,8 @@ components:
       max_tokens: 800
       batch_size: 8
       temperature: 0.1
+      max_input_chars: 1500
+      truncation_side: "right"  # "right" = corta final, "left" = corta inicio (preserva final)
 
   # Text vectorizer (GTE multilingual for better Spanish support)
   vectorizer:

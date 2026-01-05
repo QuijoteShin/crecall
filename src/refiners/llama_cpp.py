@@ -96,6 +96,7 @@ Resumen: [resumen denso con términos expandidos]
         self.temperature = self.config.get("temperature", 0.1)  # Low for consistency
         self.prompt_template = self.config.get("prompt_template", self.DEFAULT_PROMPT_TEMPLATE)
         self.max_input_chars = self.config.get("max_input_chars", 1500)
+        self.truncation_side = self.config.get("truncation_side", "right")  # "right" o "left"
 
         self.model: Optional[Llama] = None
         self._memory_mb = 0.0
@@ -136,10 +137,18 @@ Resumen: [resumen denso con términos expandidos]
                 metadata={"skipped": "empty_input"}
             )
 
-        # Truncate long texts
-        truncated = text[:self.max_input_chars]
+        # Truncate long texts según truncation_side
         if len(text) > self.max_input_chars:
-            truncated = truncated.rsplit(" ", 1)[0] + "..."
+            if self.truncation_side == "left":
+                # Corte inverso: preserva el final (donde suele estar conclusión/pregunta)
+                truncated = "..." + text[-self.max_input_chars:]
+                truncated = truncated.split(" ", 1)[-1] if " " in truncated[4:] else truncated
+            else:
+                # Corte normal: preserva el inicio
+                truncated = text[:self.max_input_chars]
+                truncated = truncated.rsplit(" ", 1)[0] + "..."
+        else:
+            truncated = text
 
         # Build prompt
         prompt = self.prompt_template.format(text=truncated)
@@ -296,6 +305,8 @@ Resumen: [resumen denso con términos expandidos]
             "n_ctx": self.n_ctx,
             "n_gpu_layers": self.n_gpu_layers,
             "max_tokens": self.max_tokens,
+            "max_input_chars": self.max_input_chars,
+            "truncation_side": self.truncation_side,
             "estimated_vram_mb": self.VRAM_ESTIMATES.get(self._quantization, 2200),
             "is_loaded": self.model is not None
         }
