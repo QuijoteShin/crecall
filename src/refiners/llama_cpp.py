@@ -92,6 +92,8 @@ Resumen: [resumen denso con términos expandidos]
         ))
         self.n_gpu_layers = self.config.get("n_gpu_layers", -1)  # -1 = all to GPU
         self.n_ctx = self.config.get("n_ctx", 2048)
+        self.n_batch = self.config.get("n_batch", 512)  # batch size para tokenización
+        self.n_ubatch = self.config.get("n_ubatch", 512)  # micro-batch size
         self.max_tokens = self.config.get("max_tokens", 800)
         self.temperature = self.config.get("temperature", 0.1)  # Low for consistency
         self.prompt_template = self.config.get("prompt_template", self.DEFAULT_PROMPT_TEMPLATE)
@@ -255,12 +257,14 @@ Resumen: [resumen denso con términos expandidos]
             )
 
         print(f"Loading Refiner: {self.model_path.name}...")
-        print(f"  GPU layers: {self.n_gpu_layers}, Context: {self.n_ctx}")
+        print(f"  GPU layers: {self.n_gpu_layers}, Context: {self.n_ctx}, Batch: {self.n_batch}")
 
         self.model = Llama(
             model_path=str(self.model_path),
             n_gpu_layers=self.n_gpu_layers,
             n_ctx=self.n_ctx,
+            n_batch=self.n_batch,
+            n_ubatch=self.n_ubatch,
             verbose=False
         )
 
@@ -303,6 +307,8 @@ Resumen: [resumen denso con términos expandidos]
             "model_name": self.model_path.stem,
             "quantization": self._quantization,
             "n_ctx": self.n_ctx,
+            "n_batch": self.n_batch,
+            "n_ubatch": self.n_ubatch,
             "n_gpu_layers": self.n_gpu_layers,
             "max_tokens": self.max_tokens,
             "max_input_chars": self.max_input_chars,
