@@ -36,7 +36,7 @@ components:
       model_path: "models/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
       n_gpu_layers: -1  # -1 = all layers to GPU
       n_ctx: 2048
-      max_tokens: 200
+      max_tokens: 800
       batch_size: 8
       temperature: 0.1
 

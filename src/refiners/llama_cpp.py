@@ -76,7 +76,7 @@ Resumen: [resumen]
         ))
         self.n_gpu_layers = self.config.get("n_gpu_layers", -1)  # -1 = all to GPU
         self.n_ctx = self.config.get("n_ctx", 2048)
-        self.max_tokens = self.config.get("max_tokens", 200)
+        self.max_tokens = self.config.get("max_tokens", 800)
         self.temperature = self.config.get("temperature", 0.1)  # Low for consistency
         self.prompt_template = self.config.get("prompt_template", self.DEFAULT_PROMPT_TEMPLATE)
         self.max_input_chars = self.config.get("max_input_chars", 1500)

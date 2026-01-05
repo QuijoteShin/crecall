@@ -422,27 +422,24 @@ def refine_reindex(
             config=refiner_config.get('config', {})
         )
 
-        # Load both models upfront to avoid thrashing
-        console.print("[bold]Step 1/2: Semantic Refinement + Vectorization[/bold]")
-        refiner.load()
-
         vectorizer_config = cfg['components']['vectorizer']
-        vectorizer = registry.create_instance(
-            name='vectorizer',
-            class_path=vectorizer_config['class'],
-            config=vectorizer_config.get('config', {})
-        )
-        vectorizer.load()
 
         from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+        import pickle
 
-        # Process in batches: refine → vectorize → save
-        chunk_size = 100  # Write to DB every 100 items
-        total_updated = 0
+        total_refined = 0
+        total_vectorized = 0
+        MAX_SLM_INPUT = 6000  # SLM context limit
 
-        # Phase 1: Process messages (if any)
+        # ============================================================
+        # PHASE 1: REFINEMENT ONLY (Qwen loaded, GTE unloaded)
+        # ============================================================
+        console.print("\n[bold cyan]═══ PHASE 1: Semantic Refinement (Qwen) ═══[/bold cyan]")
+        refiner.load()
+
+        # 1a. Refine messages
         if messages:
-            console.print("[bold]Step 1/2: Processing Messages[/bold]")
+            console.print(f"\nRefining {len(messages)} messages...")
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -450,15 +447,11 @@ def refine_reindex(
                 TaskProgressColumn(),
                 console=console
             ) as progress:
-                task = progress.add_task("Refining messages...", total=len(messages))
-
-                chunk_data = []
-                MAX_SLM_INPUT = 6000  # SLM context limit
+                task = progress.add_task("Messages...", total=len(messages))
 
                 for i in range(0, len(messages), batch_size):
                     batch = messages[i:i + batch_size]
 
-                    # Truncate long texts to avoid SLM hanging
                     texts = []
                     for msg in batch:
                         text = msg.vectorizable_content or ''
@@ -466,52 +459,30 @@ def refine_reindex(
                             text = text[:MAX_SLM_INPUT] + '...'
                         texts.append(text)
 
-                    # Refine batch
                     refinements = refiner.refine_batch(texts)
 
-                    # Vectorize refined content immediately
-                    refined_texts = [r.refined_content for r in refinements]
-                    vectors = vectorizer.vectorize_batch(refined_texts)
+                    # Save refined_content ONLY (no vector yet)
+                    conn = storage._connect()
+                    for msg, refinement in zip(batch, refinements):
+                        conn.execute("""
+                            UPDATE messages SET refined_content = ? WHERE id = ?
+                        """, (refinement.refined_content, msg.normalized.id))
+                    conn.commit()
 
-                    # Accumulate for batch write
-                    for msg, refinement, vector in zip(batch, refinements, vectors):
-                        chunk_data.append({
-                            'message_id': msg.normalized.id,
-                            'refined_content': refinement.refined_content,
-                            'vector': vector
-                        })
-
+                    total_refined += len(batch)
                     progress.update(task, advance=len(batch))
 
-                    # Write batch to DB
-                    if len(chunk_data) >= chunk_size:
-                        updated = storage.update_refined_content_batch(chunk_data)
-                        total_updated += updated
-                        chunk_data = []
-
-                # Write remaining data
-                if chunk_data:
-                    updated = storage.update_refined_content_batch(chunk_data)
-                    total_updated += updated
-
-        # Phase 2: Process chunks if enabled
+        # 1b. Refine chunks
         if include_chunks or chunks_only:
-            console.print("\n[bold]Step 2/2: Processing Chunks[/bold]")
-
-            # Get chunks needing refinement
             conn = storage._connect()
             if force:
                 cursor = conn.execute("SELECT chunk_id, chunk_text FROM message_chunks")
             else:
                 cursor = conn.execute("SELECT chunk_id, chunk_text FROM message_chunks WHERE refined_text IS NULL")
-
             chunks_to_process = cursor.fetchall()
-            console.print(f"Found {len(chunks_to_process)} chunks to refine")
 
             if chunks_to_process:
-                import pickle
-                chunk_updates = []
-
+                console.print(f"\nRefining {len(chunks_to_process)} chunks...")
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
@@ -519,72 +490,133 @@ def refine_reindex(
                     TaskProgressColumn(),
                     console=console
                 ) as progress:
-                    task = progress.add_task("Refining chunks...", total=len(chunks_to_process))
+                    task = progress.add_task("Chunks...", total=len(chunks_to_process))
 
                     for i in range(0, len(chunks_to_process), batch_size):
                         batch = chunks_to_process[i:i + batch_size]
                         chunk_ids = [c[0] for c in batch]
                         chunk_texts = [c[1] or '' for c in batch]
 
-                        # Refine
                         refinements = refiner.refine_batch(chunk_texts)
 
-                        # Vectorize refined content
-                        refined_texts = [r.refined_content for r in refinements]
-                        vectors = vectorizer.vectorize_batch(refined_texts)
+                        # Save refined_text ONLY (no vector yet)
+                        for chunk_id, refinement in zip(chunk_ids, refinements):
+                            conn.execute("""
+                                UPDATE message_chunks SET refined_text = ? WHERE chunk_id = ?
+                            """, (refinement.refined_content, chunk_id))
+                        conn.commit()
 
-                        # Prepare updates
-                        for chunk_id, refinement, vector in zip(chunk_ids, refinements, vectors):
-                            chunk_updates.append((
-                                refinement.refined_content,
-                                chunk_id,
-                                pickle.dumps(vector)
-                            ))
-
+                        total_refined += len(batch)
                         progress.update(task, advance=len(batch))
 
-                        # Write batch
-                        if len(chunk_updates) >= 100:
-                            conn.executemany("""
-                                UPDATE message_chunks SET refined_text = ? WHERE chunk_id = ?
-                            """, [(u[0], u[1]) for u in chunk_updates])
-
-                            for u in chunk_updates:
-                                conn.execute("""
-                                    INSERT OR REPLACE INTO vectors (entity_id, entity_type, vector, vector_dim, model_version)
-                                    VALUES (?, 'chunk', ?, 768, ?)
-                                """, (u[1], u[2], vectorizer_config['config'].get('model', 'unknown')))
-
-                            conn.commit()
-                            total_updated += len(chunk_updates)
-                            chunk_updates = []
-
-                    # Write remaining
-                    if chunk_updates:
-                        conn.executemany("""
-                            UPDATE message_chunks SET refined_text = ? WHERE chunk_id = ?
-                        """, [(u[0], u[1]) for u in chunk_updates])
-
-                        for u in chunk_updates:
-                            conn.execute("""
-                                INSERT OR REPLACE INTO vectors (entity_id, entity_type, vector, vector_dim, model_version)
-                                VALUES (?, 'chunk', ?, 768, ?)
-                            """, (u[1], u[2], vectorizer_config['config'].get('model', 'unknown')))
-
-                        conn.commit()
-                        total_updated += len(chunk_updates)
-
+        # Unload Qwen to free VRAM
         refiner.unload()
+        console.print(f"[green]✓ Refined {total_refined} items[/green]")
+
+        # ============================================================
+        # PHASE 2: VECTORIZATION ONLY (GTE loaded, Qwen unloaded)
+        # ============================================================
+        console.print("\n[bold cyan]═══ PHASE 2: Vectorization (GTE) ═══[/bold cyan]")
+
+        vectorizer = registry.create_instance(
+            name='vectorizer',
+            class_path=vectorizer_config['class'],
+            config=vectorizer_config.get('config', {})
+        )
+        vectorizer.load()
+        model_version = vectorizer_config['config'].get('model', 'unknown')
+
+        conn = storage._connect()
+
+        # 2a. Vectorize messages with refined_content
+        cursor = conn.execute("""
+            SELECT m.id, m.refined_content
+            FROM messages m
+            LEFT JOIN vectors v ON m.id = v.entity_id AND v.entity_type = 'message'
+            WHERE m.refined_content IS NOT NULL
+            AND (v.vector IS NULL OR v.model_version != ?)
+        """, (model_version,))
+        messages_to_vec = cursor.fetchall()
+
+        if messages_to_vec:
+            console.print(f"\nVectorizing {len(messages_to_vec)} messages...")
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console
+            ) as progress:
+                task = progress.add_task("Messages...", total=len(messages_to_vec))
+
+                for i in range(0, len(messages_to_vec), batch_size * 2):  # Larger batches OK for GTE
+                    batch = messages_to_vec[i:i + batch_size * 2]
+                    msg_ids = [m[0] for m in batch]
+                    texts = [m[1] or '' for m in batch]
+
+                    vectors = vectorizer.vectorize_batch(texts)
+
+                    for msg_id, vec in zip(msg_ids, vectors):
+                        conn.execute("""
+                            INSERT OR REPLACE INTO vectors (entity_id, entity_type, vector, vector_dim, model_version)
+                            VALUES (?, 'message', ?, 768, ?)
+                        """, (msg_id, pickle.dumps(vec), model_version))
+                    conn.commit()
+
+                    total_vectorized += len(batch)
+                    progress.update(task, advance=len(batch))
+
+        # 2b. Vectorize chunks with refined_text
+        cursor = conn.execute("""
+            SELECT mc.chunk_id, mc.refined_text
+            FROM message_chunks mc
+            LEFT JOIN vectors v ON mc.chunk_id = v.entity_id AND v.entity_type = 'chunk'
+            WHERE mc.refined_text IS NOT NULL
+            AND (v.vector IS NULL OR v.model_version != ?)
+        """, (model_version,))
+        chunks_to_vec = cursor.fetchall()
+
+        if chunks_to_vec:
+            console.print(f"\nVectorizing {len(chunks_to_vec)} chunks...")
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console
+            ) as progress:
+                task = progress.add_task("Chunks...", total=len(chunks_to_vec))
+
+                for i in range(0, len(chunks_to_vec), batch_size * 2):
+                    batch = chunks_to_vec[i:i + batch_size * 2]
+                    chunk_ids = [c[0] for c in batch]
+                    texts = [c[1] or '' for c in batch]
+
+                    vectors = vectorizer.vectorize_batch(texts)
+
+                    for chunk_id, vec in zip(chunk_ids, vectors):
+                        conn.execute("""
+                            INSERT OR REPLACE INTO vectors (entity_id, entity_type, vector, vector_dim, model_version)
+                            VALUES (?, 'chunk', ?, 768, ?)
+                        """, (chunk_id, pickle.dumps(vec), model_version))
+                    conn.commit()
+
+                    total_vectorized += len(batch)
+                    progress.update(task, advance=len(batch))
+
         vectorizer.unload()
+        console.print(f"[green]✓ Vectorized {total_vectorized} items[/green]")
 
         # Rebuild FTS index to sync with updated content
-        console.print("Rebuilding FTS index...")
+        console.print("\nRebuilding FTS index...")
         storage.rebuild_fts_index()
         console.print("[green]✓[/green] FTS index rebuilt")
 
-        console.print(f"\n[bold green]✓ Re-indexed {total_updated} messages[/bold green]")
-        console.print(f"  Refiner: {refiner_config['config'].get('model_path', 'default')}")
-        console.print(f"  Vectorizer: {vectorizer_config['config'].get('model', 'default')}")
+        console.print(f"\n[bold green]═══ COMPLETE ═══[/bold green]")
+        console.print(f"  Refined: {total_refined} items")
+        console.print(f"  Vectorized: {total_vectorized} items")
+        console.print(f"  Refiner: {refiner_config['config'].get('model_path', 'Qwen2.5-3B')}")
+        console.print(f"  Vectorizer: {vectorizer_config['config'].get('model', 'GTE')}")
 
     except Exception as e:
         console.print(f"\n[bold red]✗ Error:[/bold red] {e}")
