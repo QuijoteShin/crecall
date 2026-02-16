@@ -92,6 +92,7 @@ class Reindexer:
         vectorizer.load()
 
         start_time = time.time()
+        next_checkpoint = self.checkpoint_interval
 
         try:
             with Progress(
@@ -117,14 +118,15 @@ class Reindexer:
 
                     progress.update(task, advance=len(batch))
 
-                    # Checkpoint
-                    if stats['processed'] % self.checkpoint_interval == 0:
+                    # Checkpoint (uses >= threshold to work with any batch size)
+                    if stats['processed'] >= next_checkpoint:
                         self._save_checkpoint({
                             'processed': stats['processed'],
                             'last_processed_id': batch[-1]['id'],
                             'timestamp': datetime.now().isoformat(),
                             'force': force,
                         })
+                        next_checkpoint = stats['processed'] + self.checkpoint_interval
 
                         # Show progress
                         elapsed = time.time() - start_time
@@ -141,6 +143,12 @@ class Reindexer:
         # Clear checkpoint on success
         if stats['errors'] == 0:
             self._clear_checkpoint()
+
+        # Rebuild FTS index para incluir refined_content actualizado
+        if stats['processed'] > 0:
+            console.print("\n[bold]Rebuilding FTS index...[/bold]")
+            self._rebuild_fts_index(storage)
+            console.print("  [green]✓[/green] FTS index rebuilt")
 
         # Final stats
         elapsed = time.time() - start_time
@@ -241,15 +249,18 @@ class Reindexer:
                 WHERE message_id = ?
             """, (refinement.refined_content, msg_id))
 
-            # Update messages table with classification from Qwen
+            # Update messages table with classification from Qwen + refined_content para FTS
             has_question = refinement.metadata.get('has_question', False)
             topics_str = ','.join(refinement.entities[:10]) if refinement.entities else ''
 
+            # Extraer solo Términos expandidos para semantic_keywords (mejor para FTS)
+            semantic_keywords = self._extract_semantic_keywords(refinement)
+
             cur.execute("""
                 UPDATE messages
-                SET intent = ?, topics = ?, is_question = ?
+                SET intent = ?, topics = ?, is_question = ?, refined_content = ?
                 WHERE id = ?
-            """, (refinement.intent or 'unknown', topics_str, has_question, msg_id))
+            """, (refinement.intent or 'unknown', topics_str, has_question, semantic_keywords, msg_id))
 
             # Update vector
             vector_blob = vector.astype(np.float32).tobytes()
@@ -268,6 +279,53 @@ class Reindexer:
 
         conn.commit()
         conn.close()
+
+    def _rebuild_fts_index(self, storage: IStorage):
+        """Rebuild FTS index to include updated refined_content."""
+        import sqlite3
+
+        db_path = self.config['components']['storage']['config']['database']
+        conn = sqlite3.connect(db_path)
+
+        # Rebuild FTS index from scratch
+        conn.execute("DELETE FROM messages_fts")
+        conn.execute("""
+            INSERT INTO messages_fts(rowid, id, content, clean_content, vectorizable_content, refined_content)
+            SELECT rowid, id, content, clean_content, vectorizable_content, refined_content FROM messages
+        """)
+        conn.commit()
+        conn.close()
+
+    def _extract_semantic_keywords(self, refinement) -> str:
+        """
+        Extrae términos expandidos para FTS.
+
+        Input (refinement.entities):
+            ['SaaS (Software as a Service)', 'API (Application Programming Interface)', ...]
+
+        Output:
+            'SaaS Software as a Service API Application Programming Interface ...'
+
+        Esto permite que FTS encuentre tanto "SaaS" como "Software as a Service".
+        """
+        keywords = []
+
+        # Agregar intención
+        if refinement.intent:
+            keywords.append(refinement.intent)
+
+        # Agregar entidades/términos expandidos
+        for entity in (refinement.entities or []):
+            # Limpiar paréntesis y separar sigla de expansión
+            # 'SaaS (Software as a Service)' → 'SaaS Software as a Service'
+            clean = entity.replace('(', ' ').replace(')', ' ').strip()
+            keywords.append(clean)
+
+        # Agregar resumen si existe
+        if refinement.summary:
+            keywords.append(refinement.summary)
+
+        return ' '.join(keywords)
 
     def _get_storage(self) -> IStorage:
         """Get storage instance."""

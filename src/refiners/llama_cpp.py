@@ -7,7 +7,7 @@ from typing import List, Optional, Dict, Any
 from pathlib import Path
 
 try:
-    from llama_cpp import Llama
+    from llama_cpp import Llama, LlamaCache
     LLAMA_CPP_AVAILABLE = True
 except ImportError:
     LLAMA_CPP_AVAILABLE = False
@@ -99,8 +99,11 @@ Resumen: [resumen denso con términos expandidos]
         self.prompt_template = self.config.get("prompt_template", self.DEFAULT_PROMPT_TEMPLATE)
         self.max_input_chars = self.config.get("max_input_chars", 1500)
         self.truncation_side = self.config.get("truncation_side", "right")  # "right" o "left"
+        self.use_cache = self.config.get("use_cache", True)  # LlamaCache para reusar KV del prefijo
+        self.cache_size_gb = self.config.get("cache_size_gb", 2)  # Tamaño del cache en GB
 
         self.model: Optional[Llama] = None
+        self._cache: Optional[LlamaCache] = None
         self._memory_mb = 0.0
         self._quantization = self._detect_quantization()
 
@@ -268,6 +271,13 @@ Resumen: [resumen denso con términos expandidos]
             verbose=False
         )
 
+        # Configurar LlamaCache para reusar KV del prefijo (system prompt)
+        if self.use_cache:
+            cache_bytes = self.cache_size_gb * 1024 * 1024 * 1024
+            self._cache = LlamaCache(capacity_bytes=cache_bytes)
+            self.model.set_cache(self._cache)
+            print(f"  LlamaCache: {self.cache_size_gb}GB (reutiliza KV del prefijo)")
+
         # Estimate VRAM usage
         self._memory_mb = float(self.VRAM_ESTIMATES.get(self._quantization, 2200))
 
@@ -279,6 +289,11 @@ Resumen: [resumen denso con términos expandidos]
             return  # Already unloaded (idempotent)
 
         print("Unloading Refiner...")
+
+        # Limpiar cache primero
+        if self._cache is not None:
+            del self._cache
+            self._cache = None
 
         del self.model
         self.model = None
@@ -313,6 +328,8 @@ Resumen: [resumen denso con términos expandidos]
             "max_tokens": self.max_tokens,
             "max_input_chars": self.max_input_chars,
             "truncation_side": self.truncation_side,
+            "use_cache": self.use_cache,
+            "cache_size_gb": self.cache_size_gb,
             "estimated_vram_mb": self.VRAM_ESTIMATES.get(self._quantization, 2200),
             "is_loaded": self.model is not None
         }

@@ -35,14 +35,15 @@ components:
     config:
       model_path: "models/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
       n_gpu_layers: -1  # -1 = all layers to GPU
-      n_ctx: 2048
-      n_batch: 512      # batch size para tokenización (default 512)
-      n_ubatch: 512     # micro-batch size (default 512)
-      max_tokens: 800
-      batch_size: 8
+      n_ctx: 1024       # Reducido de 2048 para menor uso de RAM
+      n_batch: 256      # batch size para tokenización (reducido)
+      n_ubatch: 256     # micro-batch size (reducido)
+      max_tokens: 400   # Reducido de 800 para menor KV cache
+      batch_size: 4     # Reducido de 8 para menor memoria por batch
       temperature: 0.1
-      max_input_chars: 1500
-      truncation_side: "right"  # "right" = corta final, "left" = corta inicio (preserva final)
+      max_input_chars: 1200  # Reducido para caber en n_ctx=1024
+      truncation_side: "right"
+      use_cache: false  # DESHABILITADO temporalmente para evitar OOM
 
   # Text vectorizer (GTE multilingual for better Spanish support)
   vectorizer:
